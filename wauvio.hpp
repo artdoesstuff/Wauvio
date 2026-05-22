@@ -2,7 +2,6 @@
 //  W A U V I O . H P P  —  Advanced Audio Synthesis Engine  v1.3.2
 //  Header-only C++ audio synthesis library
 //
-//  ENGINE ONLY — contains zero preset sounds, SFX, or music.
 //  Refer to https://github.com/artdoesstuff-ex/Wauvio-Test if examples are needed.
 //
 //  §1   Constants
