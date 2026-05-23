@@ -1,5 +1,5 @@
 // =============================================================================
-//  W A U V I O . H P P  —  Advanced Audio Synthesis Engine  v1.3.2
+//  W A U V I O . H P P  -  Advanced Audio Synthesis Engine  v1.3.3
 //  Header-only C++ audio synthesis library
 //
 //  Refer to https://github.com/artdoesstuff-ex/Wauvio-Test if examples are needed.
@@ -32,7 +32,7 @@
 //  §26  Drum Sequencer
 //  §27  Master Bus
 //  §28  WAV Export  (mono + stereo)
-//  §29  Playback Backend  (Linux ffmpeg / Windows WaveOut)
+//  §29  Playback  (concurrent, non-blocking, thread-safe runtime)
 //
 //  Compile:
 //    Linux  : g++ -std=c++17 -O2 your_program.cpp -o your_program
@@ -43,16 +43,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -94,7 +100,7 @@ inline Config& global_config() {
 // =============================================================================
 //  §3  BUFFER SYSTEM
 //  Mono: std::vector<float>
-//  Stereo: StereoBuffer — pair of equal-length mono buffers (L, R)
+//  Stereo: StereoBuffer - pair of equal-length mono buffers (L, R)
 // =============================================================================
 
 using Buffer = std::vector<float>;
@@ -544,7 +550,7 @@ public:
 
 // =============================================================================
 //  §11  LOOPABLE ENVELOPE
-//  Loops the attack→decay→sustain cycle indefinitely — behaves like a
+//  Loops the attack→decay→sustain cycle indefinitely - behaves like a
 //  slow LFO with a shaped waveform.
 // =============================================================================
 
@@ -642,7 +648,7 @@ private:
 
 // =============================================================================
 //  §13  STATE VARIABLE FILTER (SVF)
-//  Topology-preserving TPT form (Vadim Zavalishin) — no pre-warping needed.
+//  Topology-preserving TPT form (Vadim Zavalishin) - no pre-warping needed.
 //  Provides simultaneous LP, HP, and BP outputs.
 //  Q > 0.5: resonance; Q = 0.707: Butterworth; Q → ∞: self-oscillation.
 // =============================================================================
@@ -864,21 +870,21 @@ private:
 };
 
 // =============================================================================
-//  §18  REVERB  — Schroeder structure
+//  §18  REVERB  - Schroeder structure
 //  4 parallel feedback comb filters → 2 series allpass filters.
 //  Classic digital reverb suitable for atmospheric tails.
 // =============================================================================
 
 class Reverb {
 public:
-    float room_size = 0.8f;   ///< [0,1] — longer = larger room
-    float damping   = 0.5f;   ///< [0,1] — higher = duller high frequencies
+    float room_size = 0.8f;   ///< [0,1] - longer = larger room
+    float damping   = 0.5f;   ///< [0,1] - higher = duller high frequencies
     float wet       = 0.3f;
     float dry       = 1.0f;
 
     void init(int sample_rate = 0) {
         if (sample_rate <= 0) sample_rate = global_config().sample_rate;
-        // Comb filter delay lengths (in samples) — prime-ish values
+        // Comb filter delay lengths (in samples) - prime-ish values
         static const int comb_ms[] = { 29, 37, 41, 43 };
         for (int i = 0; i < 4; ++i) {
             const int len = comb_ms[i] * sample_rate / 1000;
@@ -1082,7 +1088,7 @@ public:
         }
     }
 
-    /// Stereo version — applies same gain reduction to both channels.
+    /// Stereo version - applies same gain reduction to both channels.
     void apply(StereoBuffer& target, const Buffer& trigger, int sample_rate = 0) const {
         Buffer L_copy = target.L;
         apply(target.L, trigger, sample_rate);
@@ -1152,7 +1158,7 @@ inline void apply_volume_automation(StereoBuffer& buf,
     }
 }
 
-/// Apply an SVF cutoff automation — filter moves from point to point.
+/// Apply an SVF cutoff automation - filter moves from point to point.
 inline Buffer apply_filter_automation(const Buffer& src,
                                        const std::vector<AutoPoint>& cutoff_pts,
                                        double Q,
@@ -1221,7 +1227,7 @@ struct Voice {
     }
 };
 
-/// Polyphonic voice manager — allocates voices, handles stealing.
+/// Polyphonic voice manager - allocates voices, handles stealing.
 class VoiceManager {
 public:
     static constexpr int MAX_VOICES = 16;
@@ -1581,88 +1587,408 @@ inline void save_wav_stereo(const StereoBuffer& buf, const std::string& path,
 }
 
 // =============================================================================
-//  §29  PLAYBACK BACKEND
-//  Stereo-aware: interleaves L/R before sending to system audio.
+//  §29  PLAYBACK  v1.3.3
 // =============================================================================
 
-#ifdef WAUVIO_LINUX
-inline void play(const Buffer& buf, int sample_rate = 0) {
-    if (sample_rate <= 0) sample_rate = global_config().sample_rate;
-    const std::string sr  = std::to_string(sample_rate);
-    const std::string cmd =
-        "ffmpeg -hide_banner -loglevel error -f s16le -ar " + sr + " -ac 1 -i pipe:0 "
-        "-f alsa default 2>/dev/null || "
-        "ffmpeg -hide_banner -loglevel error -f s16le -ar " + sr + " -ac 1 -i pipe:0 "
-        "-f pulse default 2>/dev/null || "
-        "ffplay -hide_banner -loglevel error -f s16le -ar " + sr + " -ac 1 -";
-    FILE* pipe = popen(cmd.c_str(), "w");
-    if (!pipe) throw std::runtime_error("wauvio::play — cannot open pipe (ffmpeg/ffplay needed)");
-    const auto pcm = to_pcm16(buf);
-    std::fwrite(pcm.data(), sizeof(int16_t), pcm.size(), pipe);
-    pclose(pipe);
-}
+namespace detail {
 
-inline void play(const StereoBuffer& buf, int sample_rate = 0) {
-    if (sample_rate <= 0) sample_rate = global_config().sample_rate;
-    const std::string sr  = std::to_string(sample_rate);
-    const std::string cmd =
-        "ffmpeg -hide_banner -loglevel error -f s16le -ar " + sr + " -ac 2 -i pipe:0 "
-        "-f alsa default 2>/dev/null || "
-        "ffmpeg -hide_banner -loglevel error -f s16le -ar " + sr + " -ac 2 -i pipe:0 "
-        "-f pulse default 2>/dev/null || "
-        "ffplay -hide_banner -loglevel error -f s16le -ar " + sr + " -ac 2 -";
-    FILE* pipe = popen(cmd.c_str(), "w");
-    if (!pipe) throw std::runtime_error("wauvio::play — cannot open pipe (ffmpeg/ffplay needed)");
-    Buffer il = buf.interleave();
-    const auto pcm = to_pcm16(il);
-    std::fwrite(pcm.data(), sizeof(int16_t), pcm.size(), pipe);
-    pclose(pipe);
-}
+// ---------------------------------------------------------------------------
+//  Internal state of one playback stream
+// ---------------------------------------------------------------------------
+class PlaybackInstance {
+public:
+    // Construct with a pre-converted PCM buffer + metadata.
+    // The PCM data is moved in - this instance owns it exclusively.
+    PlaybackInstance(std::vector<int16_t> pcm, int sample_rate, int channels)
+        : pcm_(std::move(pcm))
+        , sample_rate_(sample_rate)
+        , channels_(channels)
+        , stopped_(false)
+        , paused_(false)
+        , playing_(true)
+        , volume_(1.0f)
+    {}
+
+    // Non-copyable, non-movable (shared_ptr is the indirection layer).
+    PlaybackInstance(const PlaybackInstance&)            = delete;
+    PlaybackInstance& operator=(const PlaybackInstance&) = delete;
+
+    // ---- Public control API ----
+
+    void stop() {
+        stopped_.store(true, std::memory_order_release);
+        // Wake the worker if it is paused so it can exit cleanly.
+        {
+            std::lock_guard<std::mutex> lk(pause_mtx_);
+            paused_.store(false, std::memory_order_release);
+        }
+        pause_cv_.notify_all();
+    }
+
+    void pause() {
+        paused_.store(true, std::memory_order_release);
+    }
+
+    void resume() {
+        {
+            std::lock_guard<std::mutex> lk(pause_mtx_);
+            paused_.store(false, std::memory_order_release);
+        }
+        pause_cv_.notify_all();
+    }
+
+    bool is_playing() const noexcept {
+        return playing_.load(std::memory_order_acquire);
+    }
+
+    void set_volume(float v) noexcept {
+        volume_.store(v < 0.0f ? 0.0f : (v > 2.0f ? 2.0f : v),
+                      std::memory_order_relaxed);
+    }
+
+    float volume() const noexcept {
+        return volume_.load(std::memory_order_relaxed);
+    }
+
+    // ---- Worker entry point ----
+    // Called once from the worker thread spawned by PlaybackRuntime.
+
+    void run() {
+#ifdef WAUVIO_LINUX
+        run_linux();
+#elif defined(WAUVIO_WINDOWS)
+        run_windows();
 #endif
+        playing_.store(false, std::memory_order_release);
+    }
+
+private:
+    // PCM data (owned exclusively by this instance)
+    std::vector<int16_t> pcm_;
+    int                  sample_rate_;
+    int                  channels_;
+
+    // Atomic flags - readable from any thread without locking
+    std::atomic<bool>  stopped_;
+    std::atomic<bool>  paused_;
+    std::atomic<bool>  playing_;
+    std::atomic<float> volume_;
+
+    // Pause mechanism
+    std::mutex              pause_mtx_;
+    std::condition_variable pause_cv_;
+
+    // Block the worker while paused (or exit immediately if stopped).
+    void wait_while_paused() {
+        std::unique_lock<std::mutex> lk(pause_mtx_);
+        pause_cv_.wait(lk, [this]{
+            return !paused_.load(std::memory_order_acquire)
+                || stopped_.load(std::memory_order_acquire);
+        });
+    }
+
+    // Apply current volume to a chunk of samples (in-place, temporary copy).
+    // We write from a local scaled buffer so the master pcm_ stays intact
+    // (allows replay in future iterations if needed).
+    static void scale_chunk(const int16_t* src, int16_t* dst,
+                             size_t count, float vol) noexcept
+    {
+        for (size_t i = 0; i < count; ++i) {
+            float s = static_cast<float>(src[i]) * vol;
+            s = s < -32768.0f ? -32768.0f : (s > 32767.0f ? 32767.0f : s);
+            dst[i] = static_cast<int16_t>(s);
+        }
+    }
+
+#ifdef WAUVIO_LINUX
+    // ---- Linux: stream PCM to ffmpeg/ffplay via popen ----
+    // We write in small chunks so we can honour stop/pause between writes.
+
+    static constexpr size_t CHUNK_FRAMES = 4096; // frames per write
+
+    void run_linux() {
+        const std::string sr  = std::to_string(sample_rate_);
+        const std::string ach = std::to_string(channels_);
+        const std::string cmd =
+            "ffmpeg -hide_banner -loglevel error "
+            "-f s16le -ar " + sr + " -ac " + ach + " -i pipe:0 "
+            "-f alsa default 2>/dev/null || "
+            "ffmpeg -hide_banner -loglevel error "
+            "-f s16le -ar " + sr + " -ac " + ach + " -i pipe:0 "
+            "-f pulse default 2>/dev/null || "
+            "ffplay -hide_banner -loglevel error "
+            "-f s16le -ar " + sr + " -ac " + ach + " -";
+
+        FILE* pipe = popen(cmd.c_str(), "w");
+        if (!pipe) { playing_.store(false, std::memory_order_release); return; }
+
+        const size_t chunk_samples = CHUNK_FRAMES * static_cast<size_t>(channels_);
+        std::vector<int16_t> chunk(chunk_samples);
+        size_t pos = 0;
+
+        while (pos < pcm_.size()) {
+            // Honour stop
+            if (stopped_.load(std::memory_order_acquire)) break;
+
+            // Honour pause: block until resumed or stopped
+            if (paused_.load(std::memory_order_acquire)) {
+                wait_while_paused();
+                if (stopped_.load(std::memory_order_acquire)) break;
+            }
+
+            const size_t remaining = pcm_.size() - pos;
+            const size_t n         = remaining < chunk_samples ? remaining : chunk_samples;
+
+            scale_chunk(pcm_.data() + pos, chunk.data(), n,
+                        volume_.load(std::memory_order_relaxed));
+
+            if (std::fwrite(chunk.data(), sizeof(int16_t), n, pipe) != n) break;
+            pos += n;
+        }
+
+        pclose(pipe);
+    }
+#endif // WAUVIO_LINUX
 
 #ifdef WAUVIO_WINDOWS
-inline void play(const Buffer& buf, int sample_rate = 0) {
+    // ---- Windows: stream PCM via WaveOut double-buffering ----
+    // We use two alternating WAVEHDR buffers so we can check
+    // stop/pause between buffer completions without a Sleep() spin.
+
+    static constexpr DWORD CHUNK_FRAMES_WIN = 4096;
+
+    void run_windows() {
+        const DWORD  sr   = static_cast<DWORD>(sample_rate_);
+        const WORD   ch   = static_cast<WORD>(channels_);
+        const WORD   ba   = static_cast<WORD>(ch * 2);          // block align
+        const DWORD  abps = static_cast<DWORD>(sr) * ba;        // avg bytes/sec
+
+        WAVEFORMATEX wfx{};
+        wfx.wFormatTag      = WAVE_FORMAT_PCM;
+        wfx.nChannels       = ch;
+        wfx.nSamplesPerSec  = sr;
+        wfx.wBitsPerSample  = 16;
+        wfx.nBlockAlign     = ba;
+        wfx.nAvgBytesPerSec = abps;
+
+        HWAVEOUT hwo = nullptr;
+        if (waveOutOpen(&hwo, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL)
+                != MMSYSERR_NOERROR)
+            return;
+
+        const size_t chunk_samples =
+            static_cast<size_t>(CHUNK_FRAMES_WIN) * static_cast<size_t>(channels_);
+        const DWORD  chunk_bytes   = static_cast<DWORD>(chunk_samples * 2u);
+
+        // Two alternating PCM buffers (double-buffering)
+        std::vector<int16_t> bufs[2];
+        bufs[0].resize(chunk_samples);
+        bufs[1].resize(chunk_samples);
+        WAVEHDR hdrs[2]{};
+        for (int b = 0; b < 2; ++b) {
+            hdrs[b].lpData         = reinterpret_cast<LPSTR>(bufs[b].data());
+            hdrs[b].dwBufferLength = chunk_bytes;
+            waveOutPrepareHeader(hwo, &hdrs[b], sizeof(WAVEHDR));
+        }
+
+        size_t pos  = 0;
+        int    slot = 0;
+
+        while (pos < pcm_.size()) {
+            if (stopped_.load(std::memory_order_acquire)) break;
+            if (paused_.load(std::memory_order_acquire)) {
+                // Wait while paused, but don't block WaveOut - let it drain
+                wait_while_paused();
+                if (stopped_.load(std::memory_order_acquire)) break;
+            }
+
+            WAVEHDR& hdr = hdrs[slot];
+
+            // Wait for this slot to finish if it's still playing
+            while ((hdr.dwFlags & WHDR_INQUEUE) && !stopped_.load(std::memory_order_acquire)) {
+                Sleep(1);
+            }
+            if (stopped_.load(std::memory_order_acquire)) break;
+
+            const size_t remaining = pcm_.size() - pos;
+            const size_t n = remaining < chunk_samples ? remaining : chunk_samples;
+
+            scale_chunk(pcm_.data() + pos, bufs[slot].data(), n,
+                        volume_.load(std::memory_order_relaxed));
+
+            // Zero-pad the last partial chunk
+            if (n < chunk_samples)
+                std::fill(bufs[slot].begin() + static_cast<ptrdiff_t>(n),
+                          bufs[slot].end(), int16_t{0});
+
+            hdr.dwBufferLength = static_cast<DWORD>(n * 2u);
+            waveOutWrite(hwo, &hdr, sizeof(WAVEHDR));
+
+            pos  += n;
+            slot  = 1 - slot;
+        }
+
+        // Drain: wait for both buffers to complete
+        for (int b = 0; b < 2; ++b) {
+            while ((hdrs[b].dwFlags & WHDR_INQUEUE)) Sleep(1);
+        }
+
+        for (int b = 0; b < 2; ++b)
+            waveOutUnprepareHeader(hwo, &hdrs[b], sizeof(WAVEHDR));
+
+        waveOutReset(hwo);
+        waveOutClose(hwo);
+    }
+#endif // WAUVIO_WINDOWS
+};
+
+// ---------------------------------------------------------------------------
+//  PlaybackRuntime - singleton registry of active instances
+// ---------------------------------------------------------------------------
+class PlaybackRuntime {
+public:
+    static PlaybackRuntime& instance() {
+        static PlaybackRuntime rt;
+        return rt;
+    }
+
+    // Launch a new PlaybackInstance on its own thread.
+    // Returns a shared_ptr so the caller can build a PlaybackHandle.
+    std::shared_ptr<PlaybackInstance> launch(
+            std::vector<int16_t> pcm, int sample_rate, int channels)
+    {
+        auto inst = std::make_shared<PlaybackInstance>(
+                std::move(pcm), sample_rate, channels);
+
+        // Register a weak_ptr in the registry before spawning the thread.
+        {
+            std::lock_guard<std::mutex> lk(registry_mtx_);
+            // Opportunistic cleanup of dead entries
+            registry_.remove_if(
+                [](const std::weak_ptr<PlaybackInstance>& w){ return w.expired(); });
+            registry_.emplace_back(inst);
+        }
+
+        // Spawn worker thread.  The thread holds a strong shared_ptr so the
+        // instance lives until playback finishes even if the caller discards
+        // their PlaybackHandle.
+        std::thread([inst]() mutable {
+            inst->run();
+            // inst falls out of scope here - ref-count drops, memory freed
+        }).detach();
+
+        return inst;
+    }
+
+    // Request all active streams to stop (useful for clean shutdown).
+    void stop_all() {
+        std::lock_guard<std::mutex> lk(registry_mtx_);
+        for (auto& w : registry_) {
+            if (auto s = w.lock()) s->stop();
+        }
+        registry_.clear();
+    }
+
+    ~PlaybackRuntime() { stop_all(); }
+
+private:
+    PlaybackRuntime() = default;
+
+    std::mutex                                    registry_mtx_;
+    std::list<std::weak_ptr<PlaybackInstance>>    registry_;
+};
+
+} // namespace detail
+
+// =============================================================================
+//  PUBLIC API - PlaybackHandle
+// =============================================================================
+
+/// Lightweight, copyable handle to an in-flight playback stream.
+/// All methods are thread-safe.
+/// Discarding the handle does NOT stop playback (fire-and-forget).
+class PlaybackHandle {
+public:
+    PlaybackHandle() = default;
+    explicit PlaybackHandle(std::shared_ptr<detail::PlaybackInstance> inst)
+        : inst_(std::move(inst)) {}
+
+    /// Stop playback immediately and release resources.
+    void stop()   { if (inst_) inst_->stop();   }
+
+    /// Pause playback (resume() to continue).
+    void pause()  { if (inst_) inst_->pause();  }
+
+    /// Resume after pause().
+    void resume() { if (inst_) inst_->resume(); }
+
+    /// Returns true while the worker thread is still active.
+    bool is_playing() const noexcept {
+        return inst_ && inst_->is_playing();
+    }
+
+    /// Set output volume multiplier [0.0, 2.0].  Thread-safe.
+    void set_volume(float v) { if (inst_) inst_->set_volume(v); }
+
+    /// Block the calling thread until playback finishes (or is stopped).
+    void wait() const {
+        if (!inst_) return;
+        while (inst_->is_playing()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+
+    /// True if this handle refers to a real stream.
+    explicit operator bool() const noexcept { return inst_ != nullptr; }
+
+private:
+    std::shared_ptr<detail::PlaybackInstance> inst_;
+};
+
+// =============================================================================
+//  play_async  -  non-blocking launch
+// =============================================================================
+
+/// Launch mono buffer playback asynchronously.
+/// Returns immediately; audio runs on a background thread.
+inline PlaybackHandle play_async(const Buffer& buf, int sample_rate = 0) {
     if (sample_rate <= 0) sample_rate = global_config().sample_rate;
-    const auto pcm = to_pcm16(buf);
-    WAVEFORMATEX wfx{};
-    wfx.wFormatTag = WAVE_FORMAT_PCM; wfx.nChannels = 1;
-    wfx.nSamplesPerSec = (DWORD)sample_rate;
-    wfx.wBitsPerSample = 16; wfx.nBlockAlign = 2;
-    wfx.nAvgBytesPerSec = (DWORD)(sample_rate * 2);
-    HWAVEOUT hwo = nullptr;
-    if (waveOutOpen(&hwo, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
-        throw std::runtime_error("waveOutOpen failed");
-    WAVEHDR hdr{};
-    hdr.lpData = (LPSTR)const_cast<int16_t*>(pcm.data());
-    hdr.dwBufferLength = (DWORD)(pcm.size() * 2u);
-    waveOutPrepareHeader(hwo, &hdr, sizeof(hdr));
-    waveOutWrite(hwo, &hdr, sizeof(hdr));
-    while (!(hdr.dwFlags & WHDR_DONE)) Sleep(10);
-    waveOutUnprepareHeader(hwo, &hdr, sizeof(hdr));
-    waveOutClose(hwo);
+    auto pcm = to_pcm16(buf);
+    auto inst = detail::PlaybackRuntime::instance().launch(
+            std::move(pcm), sample_rate, 1);
+    return PlaybackHandle(std::move(inst));
 }
 
-inline void play(const StereoBuffer& buf, int sample_rate = 0) {
+/// Launch stereo buffer playback asynchronously.
+/// Returns immediately; audio runs on a background thread.
+inline PlaybackHandle play_async(const StereoBuffer& buf, int sample_rate = 0) {
     if (sample_rate <= 0) sample_rate = global_config().sample_rate;
-    Buffer il = buf.interleave();
-    const auto pcm = to_pcm16(il);
-    WAVEFORMATEX wfx{};
-    wfx.wFormatTag = WAVE_FORMAT_PCM; wfx.nChannels = 2;
-    wfx.nSamplesPerSec = (DWORD)sample_rate;
-    wfx.wBitsPerSample = 16; wfx.nBlockAlign = 4;
-    wfx.nAvgBytesPerSec = (DWORD)(sample_rate * 4);
-    HWAVEOUT hwo = nullptr;
-    if (waveOutOpen(&hwo, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
-        throw std::runtime_error("waveOutOpen failed");
-    WAVEHDR hdr{};
-    hdr.lpData = (LPSTR)const_cast<int16_t*>(pcm.data());
-    hdr.dwBufferLength = (DWORD)(pcm.size() * 2u);
-    waveOutPrepareHeader(hwo, &hdr, sizeof(hdr));
-    waveOutWrite(hwo, &hdr, sizeof(hdr));
-    while (!(hdr.dwFlags & WHDR_DONE)) Sleep(10);
-    waveOutUnprepareHeader(hwo, &hdr, sizeof(hdr));
-    waveOutClose(hwo);
+    Buffer il  = buf.interleave();
+    auto pcm   = to_pcm16(il);
+    auto inst  = detail::PlaybackRuntime::instance().launch(
+            std::move(pcm), sample_rate, 2);
+    return PlaybackHandle(std::move(inst));
 }
-#endif
+
+// =============================================================================
+//  play  -  blocking (backward-compatible)
+// =============================================================================
+
+/// Blocking playback of a mono buffer.
+/// Internally delegates to play_async() and waits for completion.
+inline void play(const Buffer& buf, int sample_rate = 0) {
+    play_async(buf, sample_rate).wait();
+}
+
+/// Blocking playback of a stereo buffer.
+/// Internally delegates to play_async() and waits for completion.
+inline void play(const StereoBuffer& buf, int sample_rate = 0) {
+    play_async(buf, sample_rate).wait();
+}
+
+/// Stop every active playback stream immediately.
+inline void stop_all_playback() {
+    detail::PlaybackRuntime::instance().stop_all();
+}
 
 } // namespace wauvio
