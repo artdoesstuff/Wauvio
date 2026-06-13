@@ -2,7 +2,7 @@
 //  W A U V I O . H P P  -  Advanced Audio Synthesis Engine  v1.3.3
 //  Header-only C++ audio synthesis library
 //
-//  Refer to https://github.com/artdoesstuff-ex/Wauvio-Test if examples are needed.
+//  Refer to https://github.com/artdoesstuff/Wauvio/blob/main/worthy if examples are needed.
 //
 //  §1   Constants
 //  §2   Global Configuration
