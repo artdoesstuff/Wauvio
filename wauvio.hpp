@@ -1,5 +1,5 @@
 // =============================================================================
-//  W A U V I O . H P P  -  Advanced Audio Synthesis Engine  v1.3.4
+//  W A U V I O . H P P  -  Advanced Audio Synthesis Engine  v1.4.0
 //  Header-only C++ audio synthesis library
 //
 //  Refer to https://github.com/artdoesstuff/Wauvio/blob/main/worthy if examples are needed.
@@ -8,21 +8,26 @@
 //  §2   Global Configuration
 //  §3   Buffer (mono + stereo)
 //  §4   Waveform Primitives
-//  §5   WaveShape enum
-//  §6   Oscillator  (phase-accurate, unison, hard-sync)
+//  §4b  PolyBLEP Band-Limited Waveforms  (alias-reduced square/saw/tri/pulse)
+//  §5   WaveShape enum  (includes BL_ variants)
+//  §6   Oscillator  (phase-accurate, hard-sync, portamento/glide)
 //  §7   Supersaw Helper  (7-voice detuned stack)
-//  §8   Noise Generator
+//  §7b  Wavetable Oscillator  (arbitrary waveform, interpolated lookup)
+//  §8   Noise Generator  (white + pink)
 //  §9   ADSR Envelope
 //  §10  AHDSR / DAHDSR Multi-stage Envelope
 //  §11  Loopable Envelope
 //  §12  LFO System  (sine, tri, square, S&H; pitch/amp/filter/pan targets)
 //  §13  State Variable Filter  (LP/HP/BP + resonance Q)
 //  §14  Legacy 1-pole filters  (kept for compatibility)
+//  §14b Parametric EQ  (biquad: low shelf + peak + high shelf)
 //  §15  FM Synthesis
 //  §16  Distortion  (soft clip, hard clip, waveshaper)
 //  §17  Delay Line  (feedback, wet/dry)
 //  §18  Reverb  (Schroeder comb+allpass)
 //  §19  Chorus  (modulated delay)
+//  §19b Flanger  (short modulated delay with feedback)
+//  §19c Phaser   (all-pass stage sweep)
 //  §20  Stereo Buffer + Panning utilities
 //  §21  Sidechain Compressor
 //  §22  Automation  (parameter-over-time curves)
@@ -31,8 +36,8 @@
 //  §25  Note / Instrument / Track / Sequencer
 //  §26  Drum Sequencer
 //  §27  Master Bus
-//  §28  WAV Export  (mono + stereo)
-//  §29  Playback  (concurrent, non-blocking, thread-safe runtime)
+//  §28  WAV Export  (mono + stereo, shared header writer)
+//  §29  Playback  (concurrent, non-blocking, thread-safe; seek + position)
 //
 //  Compile:
 //    Linux  : g++ -std=c++17 -O2 your_program.cpp -o your_program
@@ -261,15 +266,76 @@ inline float pulse(double p, double duty = 0.5) noexcept {
 } // namespace wave
 
 // =============================================================================
+//  §4b  POLYBLEP BAND-LIMITED WAVEFORMS
+//  PolyBLEP (Polynomial Band-Limited Step) correction reduces aliasing at
+//  discontinuities in square, sawtooth, and triangle waves.  Drop-in
+//  replacements for the naive wave:: functions; phase in [0, 2π).
+// =============================================================================
+
+namespace wave_bl {
+
+/// PolyBLEP residual: smooths a unit step at normalised phase t ∈ [0,1).
+/// dt = phase_increment / TWO_PI  (one sample's worth of normalised phase)
+inline double polyblep(double t, double dt) noexcept {
+    if (t < dt) {
+        t /= dt;
+        return t + t - t * t - 1.0;
+    } else if (t > 1.0 - dt) {
+        t = (t - 1.0) / dt;
+        return t * t + t + t + 1.0;
+    }
+    return 0.0;
+}
+
+/// Band-limited sawtooth.  dt = freq / sample_rate.
+inline float sawtooth(double phase, double dt) noexcept {
+    double t   = phase / TWO_PI;
+    double saw = 2.0 * t - 1.0;
+    saw -= polyblep(t, dt);
+    return static_cast<float>(saw);
+}
+
+/// Band-limited square.  dt = freq / sample_rate.
+inline float square(double phase, double dt) noexcept {
+    double t  = phase / TWO_PI;
+    double sq = (t < 0.5) ? 1.0 : -1.0;
+    sq += polyblep(t, dt);
+    sq -= polyblep(std::fmod(t + 0.5, 1.0), dt);
+    return static_cast<float>(sq);
+}
+
+/// Band-limited triangle (integrated square, naturally alias-free below Nyquist).
+/// Requires one sample of state; pass `prev` by reference.
+inline float triangle(double phase, double dt, float& prev) noexcept {
+    float sq    = square(phase, dt);
+    float tri   = static_cast<float>(4.0 * dt) * sq + (1.0f - static_cast<float>(4.0 * dt)) * prev;
+    prev = tri;
+    return tri;
+}
+
+/// Band-limited pulse with variable duty cycle.  dt = freq / sample_rate.
+inline float pulse(double phase, double dt, double duty = 0.5) noexcept {
+    double t  = phase / TWO_PI;
+    double pw = (t < duty) ? 1.0 : -1.0;
+    pw += polyblep(t, dt);
+    pw -= polyblep(std::fmod(t + (1.0 - duty), 1.0), dt);
+    return static_cast<float>(pw);
+}
+
+} // namespace wave_bl
+
+// =============================================================================
 //  §5  WAVESHAPE ENUM
 // =============================================================================
 
-enum class WaveShape { Sine, Square, Triangle, Sawtooth, Pulse };
+enum class WaveShape { Sine, Square, Triangle, Sawtooth, Pulse,
+                       BL_Square, BL_Triangle, BL_Sawtooth, BL_Pulse };
 
 // =============================================================================
 //  §6  OSCILLATOR
-//  Phase-accumulating oscillator with hard-sync support.
+//  Phase-accumulating oscillator with hard-sync and portamento support.
 //  Hard sync: when sync_source phase resets, this oscillator resets too.
+//  Portamento: call glide_to(target, seconds) and tick() handles the ramp.
 // =============================================================================
 
 class Oscillator {
@@ -286,17 +352,40 @@ public:
         : shape(s), frequency(f), amplitude(a) {}
 
     float tick(int sample_rate) noexcept {
-        phase_ += TWO_PI * frequency / static_cast<double>(sample_rate);
+        // Portamento: smoothly move frequency toward glide_target_
+        if (glide_samples_left_ > 0) {
+            frequency += glide_step_;
+            --glide_samples_left_;
+            if (glide_samples_left_ == 0) frequency = glide_target_;
+        }
+
+        const double dt = frequency / static_cast<double>(sample_rate);
+        phase_ += TWO_PI * dt;
         if (phase_ >= TWO_PI) phase_ -= TWO_PI;
-        float s = sample_at(phase_ + phase_offset);
-        return s * static_cast<float>(amplitude);
+        return sample_at(phase_ + phase_offset, dt) * static_cast<float>(amplitude);
     }
+
+    /// Begin a smooth frequency glide to `target_freq` over `seconds`.
+    /// Call before the first tick() of a new note.
+    void glide_to(double target_freq, double seconds, int sample_rate = 0) {
+        if (sample_rate <= 0) sample_rate = global_config().sample_rate;
+        glide_target_      = target_freq;
+        glide_samples_left_ = static_cast<int>(seconds * sample_rate);
+        glide_step_ = (glide_samples_left_ > 0)
+                      ? (target_freq - frequency) / glide_samples_left_
+                      : 0.0;
+    }
+
+    /// Cancel any in-progress glide and snap to current frequency.
+    void cancel_glide() noexcept { glide_samples_left_ = 0; }
+
+    bool is_gliding() const noexcept { return glide_samples_left_ > 0; }
 
     /// Hard sync: reset phase when master crosses zero upward.
     void sync_reset() noexcept { phase_ = 0.0; }
 
-    void  reset()          noexcept { phase_ = 0.0; }
-    double phase()   const noexcept { return phase_; }
+    void   reset()             noexcept { phase_ = 0.0; }
+    double phase()       const noexcept { return phase_; }
     void   set_phase(double p) noexcept { phase_ = p; }
 
     Buffer render(double seconds, int sample_rate = 0) {
@@ -307,15 +396,24 @@ public:
     }
 
 private:
-    double phase_ = 0.0;
+    double phase_              = 0.0;
+    double glide_target_       = 440.0;
+    double glide_step_         = 0.0;
+    int    glide_samples_left_ = 0;
+    float  bl_tri_prev_        = 0.0f;  ///< State for BL triangle integrator
 
-    float sample_at(double p) const noexcept {
+    float sample_at(double p, double dt) const noexcept {
         switch (shape) {
-            case WaveShape::Sine:     return wave::sine(p);
-            case WaveShape::Square:   return wave::square(p);
-            case WaveShape::Triangle: return wave::triangle(p);
-            case WaveShape::Sawtooth: return wave::sawtooth(p);
-            case WaveShape::Pulse:    return wave::pulse(p, duty);
+            case WaveShape::Sine:        return wave::sine(p);
+            case WaveShape::Square:      return wave::square(p);
+            case WaveShape::Triangle:    return wave::triangle(p);
+            case WaveShape::Sawtooth:    return wave::sawtooth(p);
+            case WaveShape::Pulse:       return wave::pulse(p, duty);
+            case WaveShape::BL_Square:   return wave_bl::square(p, dt);
+            case WaveShape::BL_Sawtooth: return wave_bl::sawtooth(p, dt);
+            case WaveShape::BL_Triangle: return wave_bl::triangle(p, dt,
+                                             const_cast<Oscillator*>(this)->bl_tri_prev_);
+            case WaveShape::BL_Pulse:    return wave_bl::pulse(p, dt, duty);
         }
         return 0.f;
     }
@@ -396,6 +494,88 @@ public:
 };
 
 // =============================================================================
+//  §7b  WAVETABLE OSCILLATOR
+//  Lookup-table oscillator with linear interpolation.  The table can be any
+//  arbitrary waveform — fill it from the wave:: helpers, load from disk, or
+//  compute your own.  Linear-interpolated reads give good quality; combine
+//  with PolyBLEP (wave_bl::) tables for alias-free output.
+//
+//  Usage:
+//    WavetableOscillator osc;
+//    osc.load_wave(WaveShape::Sawtooth);   // or fill osc.table manually
+//    float s = osc.tick(440.0, sample_rate);
+// =============================================================================
+
+class WavetableOscillator {
+public:
+    static constexpr size_t TABLE_SIZE = 2048;
+
+    std::array<float, TABLE_SIZE> table{};
+
+    WavetableOscillator() { load_sine(); }
+
+    /// Fill the table with a standard WaveShape.
+    /// BL_ variants are pre-computed at a reference frequency of 440 Hz with
+    /// dt = 440/44100 — good alias reduction for most musical use.
+    void load_wave(WaveShape shape, double ref_freq = 440.0, int ref_sr = 44100) {
+        const double dt = ref_freq / ref_sr;
+        float bl_tri_prev = 0.0f;
+        for (size_t i = 0; i < TABLE_SIZE; ++i) {
+            const double phase = TWO_PI * static_cast<double>(i) / TABLE_SIZE;
+            switch (shape) {
+                case WaveShape::Sine:        table[i] = wave::sine(phase);        break;
+                case WaveShape::Square:      table[i] = wave::square(phase);      break;
+                case WaveShape::Triangle:    table[i] = wave::triangle(phase);    break;
+                case WaveShape::Sawtooth:    table[i] = wave::sawtooth(phase);    break;
+                case WaveShape::Pulse:       table[i] = wave::pulse(phase);       break;
+                case WaveShape::BL_Square:   table[i] = wave_bl::square(phase, dt);   break;
+                case WaveShape::BL_Sawtooth: table[i] = wave_bl::sawtooth(phase, dt); break;
+                case WaveShape::BL_Triangle: table[i] = wave_bl::triangle(phase, dt, bl_tri_prev); break;
+                case WaveShape::BL_Pulse:    table[i] = wave_bl::pulse(phase, dt);    break;
+            }
+        }
+    }
+
+    void load_sine() { load_wave(WaveShape::Sine); }
+
+    /// Fill table from an arbitrary functor: float fn(double phase_0_to_2pi).
+    template<typename Fn>
+    void load_custom(Fn&& fn) {
+        for (size_t i = 0; i < TABLE_SIZE; ++i)
+            table[i] = fn(TWO_PI * static_cast<double>(i) / TABLE_SIZE);
+    }
+
+    /// Advance phase and return the next sample (linearly interpolated).
+    float tick(double frequency, int sample_rate) noexcept {
+        phase_ = std::fmod(phase_ + frequency / sample_rate, 1.0);
+        const double idx  = phase_ * TABLE_SIZE;
+        const size_t i0   = static_cast<size_t>(idx) % TABLE_SIZE;
+        const size_t i1   = (i0 + 1) % TABLE_SIZE;
+        const float  frac = static_cast<float>(idx - static_cast<double>(i0));
+        return table[i0] * (1.0f - frac) + table[i1] * frac;
+    }
+
+    float tick(double frequency, double amplitude, int sample_rate) noexcept {
+        return tick(frequency, sample_rate) * static_cast<float>(amplitude);
+    }
+
+    void  reset()              noexcept { phase_ = 0.0; }
+    double phase()       const noexcept { return phase_; }
+    void   set_phase(double p) noexcept { phase_ = std::fmod(p, 1.0); }
+
+    Buffer render(double frequency, double amplitude,
+                  double seconds, int sample_rate = 0) {
+        if (sample_rate <= 0) sample_rate = global_config().sample_rate;
+        Buffer buf(static_cast<size_t>(seconds * sample_rate));
+        for (auto& s : buf) s = tick(frequency, amplitude, sample_rate);
+        return buf;
+    }
+
+private:
+    double phase_ = 0.0;  ///< Normalised phase in [0, 1)
+};
+
+// =============================================================================
 //  §8  NOISE GENERATOR
 // =============================================================================
 
@@ -404,19 +584,52 @@ public:
     explicit NoiseGenerator(uint32_t seed = 42u)
         : rng_(seed), dist_(-1.0f, 1.0f) {}
 
-    float  tick()  { return dist_(rng_); }
-    void   seed(uint32_t s) { rng_.seed(s); }
+    /// White noise sample in [-1, 1].
+    float tick_white() { return dist_(rng_); }
+
+    /// Pink noise sample (Paul Kellet's refined method, 1/f spectrum).
+    /// Amplitude is approximately normalised to [-1, 1].
+    float tick_pink() {
+        float white = dist_(rng_);
+        b0_ = 0.99886f * b0_ + white * 0.0555179f;
+        b1_ = 0.99332f * b1_ + white * 0.0750759f;
+        b2_ = 0.96900f * b2_ + white * 0.1538520f;
+        b3_ = 0.86650f * b3_ + white * 0.3104856f;
+        b4_ = 0.55000f * b4_ + white * 0.5329522f;
+        b5_ = -0.7616f * b5_ - white * 0.0168980f;
+        float pink = (b0_ + b1_ + b2_ + b3_ + b4_ + b5_ + b6_ + white * 0.5362f) * 0.11f;
+        b6_ = white * 0.115926f;
+        return std::max(-1.0f, std::min(1.0f, pink));
+    }
+
+    /// Convenience alias: tick() returns white noise (preserves prior behaviour).
+    float tick() { return tick_white(); }
+
+    void seed(uint32_t s) {
+        rng_.seed(s);
+        b0_ = b1_ = b2_ = b3_ = b4_ = b5_ = b6_ = 0.0f;
+    }
 
     Buffer render(double seconds, int sample_rate = 0) {
         if (sample_rate <= 0) sample_rate = global_config().sample_rate;
         Buffer buf(static_cast<size_t>(seconds * sample_rate));
-        for (auto& s : buf) s = dist_(rng_);
+        for (auto& s : buf) s = tick_white();
+        return buf;
+    }
+
+    Buffer render_pink(double seconds, int sample_rate = 0) {
+        if (sample_rate <= 0) sample_rate = global_config().sample_rate;
+        Buffer buf(static_cast<size_t>(seconds * sample_rate));
+        for (auto& s : buf) s = tick_pink();
         return buf;
     }
 
 private:
     std::mt19937 rng_;
     std::uniform_real_distribution<float> dist_;
+    // Pink noise state (Kellet's method)
+    float b0_ = 0.0f, b1_ = 0.0f, b2_ = 0.0f, b3_ = 0.0f,
+          b4_ = 0.0f, b5_ = 0.0f, b6_ = 0.0f;
 };
 
 // =============================================================================
@@ -760,6 +973,134 @@ private:
 };
 
 // =============================================================================
+//  §14b  PARAMETRIC EQ
+//  Three independent biquad bands: low shelf, peak/notch, high shelf.
+//  Each band is independently bypassable.  Uses Robert Bristow-Johnson's
+//  Audio EQ Cookbook formulae.
+// =============================================================================
+
+/// Single biquad EQ band.
+class BiquadEQ {
+public:
+    enum class Type { LowShelf, HighShelf, Peak };
+
+    Type   type      = Type::Peak;
+    double freq_hz   = 1000.0;  ///< Centre / corner frequency
+    double gain_db   = 0.0;     ///< Boost/cut in dB (Peak); shelf gain for shelves
+    double Q         = 0.707;   ///< Bandwidth / slope control
+
+    BiquadEQ() = default;
+    BiquadEQ(Type t, double f, double g, double q = 0.707)
+        : type(t), freq_hz(f), gain_db(g), Q(q) {}
+
+    float tick(float x, int sample_rate) noexcept {
+        if (cached_sr_ != sample_rate) update_coeffs(sample_rate);
+        float y = b0_ * x + b1_ * x1_ + b2_ * x2_ - a1_ * y1_ - a2_ * y2_;
+        x2_ = x1_;  x1_ = x;
+        y2_ = y1_;  y1_ = y;
+        return y;
+    }
+
+    void process(Buffer& buf, int sample_rate = 0) {
+        if (sample_rate <= 0) sample_rate = global_config().sample_rate;
+        update_coeffs(sample_rate);
+        for (auto& s : buf) s = tick(s, sample_rate);
+    }
+
+    void reset() noexcept { x1_ = x2_ = y1_ = y2_ = 0.0f; }
+
+    void update_coeffs(int sample_rate) noexcept {
+        cached_sr_ = sample_rate;
+        const double A  = std::pow(10.0, gain_db / 40.0);
+        const double w0 = TWO_PI * freq_hz / sample_rate;
+        const double cw = std::cos(w0);
+        const double sw = std::sin(w0);
+        const double alpha = sw / (2.0 * Q);
+
+        double b0 = 0.0, b1 = 0.0, b2 = 0.0, a0 = 1.0, a1 = 0.0, a2 = 0.0;
+        switch (type) {
+            case Type::Peak:
+                b0 =  1.0 + alpha * A;
+                b1 = -2.0 * cw;
+                b2 =  1.0 - alpha * A;
+                a0 =  1.0 + alpha / A;
+                a1 = -2.0 * cw;
+                a2 =  1.0 - alpha / A;
+                break;
+            case Type::LowShelf: {
+                const double sqA  = std::sqrt(A);
+                const double beta = sw * std::sqrt((A * A + 1.0) / Q - (A - 1.0) * (A - 1.0));
+                b0 =  A * ((A + 1.0) - (A - 1.0) * cw + beta);
+                b1 =  2.0 * A * ((A - 1.0) - (A + 1.0) * cw);
+                b2 =  A * ((A + 1.0) - (A - 1.0) * cw - beta);
+                a0 =       (A + 1.0) + (A - 1.0) * cw + beta;
+                a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cw);
+                a2 =        (A + 1.0) + (A - 1.0) * cw - beta;
+                (void)sqA;
+                break;
+            }
+            case Type::HighShelf: {
+                const double sqA  = std::sqrt(A);
+                const double beta = sw * std::sqrt((A * A + 1.0) / Q - (A - 1.0) * (A - 1.0));
+                b0 =  A * ((A + 1.0) + (A - 1.0) * cw + beta);
+                b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cw);
+                b2 =  A * ((A + 1.0) + (A - 1.0) * cw - beta);
+                a0 =        (A + 1.0) - (A - 1.0) * cw + beta;
+                a1 =  2.0 * ((A - 1.0) - (A + 1.0) * cw);
+                a2 =        (A + 1.0) - (A - 1.0) * cw - beta;
+                (void)sqA;
+                break;
+            }
+        }
+        b0_ = static_cast<float>(b0 / a0);
+        b1_ = static_cast<float>(b1 / a0);
+        b2_ = static_cast<float>(b2 / a0);
+        a1_ = static_cast<float>(a1 / a0);
+        a2_ = static_cast<float>(a2 / a0);
+    }
+
+private:
+    float b0_ = 1.f, b1_ = 0.f, b2_ = 0.f, a1_ = 0.f, a2_ = 0.f;
+    float x1_ = 0.f, x2_ = 0.f, y1_ = 0.f, y2_ = 0.f;
+    int   cached_sr_ = 0;
+};
+
+/// Three-band parametric EQ: low shelf + peak + high shelf.
+/// Each band can be bypassed independently by setting gain_db = 0.
+class ParametricEQ {
+public:
+    BiquadEQ low_shelf  { BiquadEQ::Type::LowShelf,  200.0,  0.0, 0.707 };
+    BiquadEQ peak       { BiquadEQ::Type::Peak,      1000.0,  0.0, 0.707 };
+    BiquadEQ high_shelf { BiquadEQ::Type::HighShelf, 6000.0,  0.0, 0.707 };
+
+    float tick(float x, int sample_rate) noexcept {
+        x = low_shelf.tick(x, sample_rate);
+        x = peak.tick(x, sample_rate);
+        x = high_shelf.tick(x, sample_rate);
+        return x;
+    }
+
+    void process(Buffer& buf, int sample_rate = 0) {
+        if (sample_rate <= 0) sample_rate = global_config().sample_rate;
+        for (auto& s : buf) s = tick(s, sample_rate);
+    }
+
+    void process(StereoBuffer& buf, int sample_rate = 0) {
+        if (sample_rate <= 0) sample_rate = global_config().sample_rate;
+        for (size_t i = 0; i < buf.size(); ++i) {
+            buf.L[i] = tick(buf.L[i], sample_rate);
+            buf.R[i] = tick(buf.R[i], sample_rate);
+        }
+    }
+
+    void reset() noexcept {
+        low_shelf.reset();
+        peak.reset();
+        high_shelf.reset();
+    }
+};
+
+// =============================================================================
 //  §15  FM SYNTHESIS  (unchanged from v1)
 // =============================================================================
 
@@ -999,6 +1340,142 @@ private:
     size_t             max_delay_ = 1;
     double             lfo_phase_ = 0.0;
     int                sr_        = 44100;
+};
+
+// =============================================================================
+//  §19b  FLANGER
+//  Short modulated delay (0.1–10 ms) mixed with the dry signal, creating
+//  comb-filter notches that sweep with the LFO.  Feedback intensifies the
+//  metallic/jet-plane sweep.
+// =============================================================================
+
+class Flanger {
+public:
+    double rate_hz   = 0.25;   ///< LFO rate
+    double depth_ms  = 2.0;    ///< Modulation depth in ms
+    double delay_ms  = 3.0;    ///< Centre delay time in ms (keep < 10 ms)
+    float  feedback  = 0.5f;   ///< Feedback amount [-1, 1]; negative = through-zero
+    float  wet       = 0.5f;
+    float  dry       = 1.0f;
+
+    void init(int sample_rate = 0) {
+        if (sample_rate <= 0) sample_rate = global_config().sample_rate;
+        sr_ = sample_rate;
+        max_delay_ = static_cast<size_t>((delay_ms + depth_ms) * 0.001 * sr_) + 2;
+        buf_.assign(max_delay_, 0.0f);
+        head_ = 0;
+        lfo_phase_ = 0.0;
+    }
+
+    float tick(float x) noexcept {
+        lfo_phase_ += TWO_PI * rate_hz / sr_;
+        if (lfo_phase_ >= TWO_PI) lfo_phase_ -= TWO_PI;
+
+        const double mod   = depth_ms * 0.001 * sr_ * std::sin(lfo_phase_);
+        const double delay = delay_ms * 0.001 * sr_ + mod;
+        const size_t d_int = static_cast<size_t>(delay);
+        const float  frac  = static_cast<float>(delay - d_int);
+
+        const size_t i0 = (head_ + max_delay_ - d_int)     % max_delay_;
+        const size_t i1 = (head_ + max_delay_ - d_int - 1) % max_delay_;
+        const float  delayed = buf_[i0] * (1.0f - frac) + buf_[i1] * frac;
+
+        buf_[head_] = x + delayed * feedback;
+        head_ = (head_ + 1) % max_delay_;
+
+        return x * dry + delayed * wet;
+    }
+
+    void process(Buffer& buf) {
+        if (buf_.empty()) init(sr_);
+        for (auto& s : buf) s = tick(s);
+    }
+
+    void reset() noexcept {
+        std::fill(buf_.begin(), buf_.end(), 0.0f);
+        head_ = 0;
+        lfo_phase_ = 0.0;
+    }
+
+private:
+    std::vector<float> buf_;
+    size_t             head_      = 0;
+    size_t             max_delay_ = 1;
+    double             lfo_phase_ = 0.0;
+    int                sr_        = 44100;
+};
+
+// =============================================================================
+//  §19c  PHASER
+//  N all-pass stages whose centre frequency is modulated by an LFO.
+//  The phase-shifted signal is mixed with dry, creating notches that sweep
+//  through the spectrum — smoother and more musical than flanging.
+//  Default: 4 stages (classic phaser); 8 stages = richer sweep.
+// =============================================================================
+
+class Phaser {
+public:
+    int    stages   = 4;       ///< Number of all-pass stages (2, 4, 6, 8 …)
+    double rate_hz  = 0.5;     ///< LFO rate
+    double depth    = 0.9;     ///< LFO depth [0, 1]
+    double base_hz  = 400.0;   ///< Lowest sweep frequency
+    double range_hz = 1600.0;  ///< Frequency range of the sweep
+    float  feedback = 0.4f;    ///< Feedback amount [0, 1)
+    float  wet      = 0.5f;
+    float  dry      = 1.0f;
+
+    void init(int sample_rate = 0) {
+        if (sample_rate <= 0) sample_rate = global_config().sample_rate;
+        sr_ = sample_rate;
+        a_.assign(static_cast<size_t>(stages), 0.0f);
+        z_.assign(static_cast<size_t>(stages), 0.0f);
+        lfo_phase_ = 0.0;
+        fb_sample_ = 0.0f;
+    }
+
+    float tick(float x) noexcept {
+        lfo_phase_ += TWO_PI * rate_hz / sr_;
+        if (lfo_phase_ >= TWO_PI) lfo_phase_ -= TWO_PI;
+
+        // Sweep: map LFO [-1,1] → [base_hz, base_hz + range_hz]
+        const double lfo = 0.5 * (1.0 + std::sin(lfo_phase_));
+        const double fc  = base_hz + depth * range_hz * lfo;
+        // First-order all-pass coefficient
+        const float  kf  = static_cast<float>(
+                               std::tan(PI * fc / sr_) - 1.0) /
+                           static_cast<float>(
+                               std::tan(PI * fc / sr_) + 1.0);
+
+        // Re-cache a_[] only when coefficient changes meaningfully
+        for (auto& av : a_) av = kf;
+
+        float s = x + fb_sample_ * feedback;
+        for (int i = 0; i < stages; ++i) {
+            float out = a_[i] * s + z_[i];
+            z_[i] = s - a_[i] * out;
+            s = out;
+        }
+        fb_sample_ = s;
+        return x * dry + s * wet;
+    }
+
+    void process(Buffer& buf) {
+        if (a_.empty()) init(sr_);
+        for (auto& s : buf) s = tick(s);
+    }
+
+    void reset() noexcept {
+        std::fill(z_.begin(), z_.end(), 0.0f);
+        fb_sample_  = 0.0f;
+        lfo_phase_  = 0.0;
+    }
+
+private:
+    std::vector<float> a_;          ///< All-pass coefficients (one per stage)
+    std::vector<float> z_;          ///< All-pass state (one per stage)
+    float              fb_sample_  = 0.0f;
+    double             lfo_phase_  = 0.0;
+    int                sr_         = 44100;
 };
 
 // =============================================================================
@@ -1579,11 +2056,36 @@ private:
 //  §28  WAV FILE EXPORT  (mono and stereo)
 // =============================================================================
 
+namespace detail {
+
+/// Write a standard 16-bit PCM WAV header and samples to an open file.
+/// `channels` must be 1 (mono) or 2 (stereo).
+inline void write_wav_impl(FILE* f, const std::vector<int16_t>& pcm,
+                            int sample_rate, int channels)
+{
+    const uint32_t dsz   = static_cast<uint32_t>(pcm.size() * 2u);
+    const uint32_t chksz = 36u + dsz;
+    const uint16_t ch    = static_cast<uint16_t>(channels);
+    const uint16_t ba    = static_cast<uint16_t>(ch * 2u);   // block align
+    const uint32_t abps  = static_cast<uint32_t>(sample_rate) * ba;
+
+    auto w4 = [&](uint32_t v){ std::fwrite(&v, 4, 1, f); };
+    auto w2 = [&](uint16_t v){ std::fwrite(&v, 2, 1, f); };
+    auto ws = [&](const char* s, size_t n){ std::fwrite(s, 1, n, f); };
+
+    ws("RIFF", 4);  w4(chksz);  ws("WAVE", 4);
+    ws("fmt ",  4);  w4(16u);   w2(1u);  w2(ch);
+    w4(static_cast<uint32_t>(sample_rate));  w4(abps);  w2(ba);  w2(16u);
+    ws("data",  4);  w4(dsz);
+    std::fwrite(pcm.data(), 2, pcm.size(), f);
+}
+
+} // namespace detail
+
+/// Save a mono buffer as a 16-bit PCM WAV file.
 inline void save_wav(const Buffer& buf, const std::string& path, int sample_rate = 0) {
     if (sample_rate <= 0) sample_rate = global_config().sample_rate;
-    const auto pcm    = to_pcm16(buf);
-    const uint32_t dsz    = static_cast<uint32_t>(pcm.size() * 2u);
-    const uint32_t chksz  = 36u + dsz;
+    const auto pcm = to_pcm16(buf);
     FILE* f = nullptr;
 #ifdef WAUVIO_WINDOWS
     fopen_s(&f, path.c_str(), "wb");
@@ -1591,26 +2093,16 @@ inline void save_wav(const Buffer& buf, const std::string& path, int sample_rate
     f = std::fopen(path.c_str(), "wb");
 #endif
     if (!f) throw std::runtime_error("save_wav: cannot open " + path);
-    auto w4 = [&](uint32_t v){ std::fwrite(&v,4,1,f); };
-    auto w2 = [&](uint16_t v){ std::fwrite(&v,2,1,f); };
-    auto ws = [&](const char* s, size_t n){ std::fwrite(s,1,n,f); };
-    ws("RIFF",4); w4(chksz); ws("WAVE",4);
-    ws("fmt ",4); w4(16); w2(1u); w2(1u);
-    w4((uint32_t)sample_rate); w4((uint32_t)(sample_rate*2)); w2(2u); w2(16u);
-    ws("data",4); w4(dsz);
-    std::fwrite(pcm.data(),2,pcm.size(),f);
+    detail::write_wav_impl(f, pcm, sample_rate, 1);
     std::fclose(f);
 }
 
-/// Save a stereo WAV (interleaved L/R, 16-bit PCM).
+/// Save a stereo buffer as an interleaved L/R 16-bit PCM WAV file.
 inline void save_wav_stereo(const StereoBuffer& buf, const std::string& path,
                              int sample_rate = 0)
 {
     if (sample_rate <= 0) sample_rate = global_config().sample_rate;
-    Buffer interleaved = buf.interleave();
-    const auto pcm     = to_pcm16(interleaved);
-    const uint32_t dsz   = static_cast<uint32_t>(pcm.size() * 2u);
-    const uint32_t chksz = 36u + dsz;
+    const auto pcm = to_pcm16(buf.interleave());
     FILE* f = nullptr;
 #ifdef WAUVIO_WINDOWS
     fopen_s(&f, path.c_str(), "wb");
@@ -1618,17 +2110,7 @@ inline void save_wav_stereo(const StereoBuffer& buf, const std::string& path,
     f = std::fopen(path.c_str(), "wb");
 #endif
     if (!f) throw std::runtime_error("save_wav_stereo: cannot open " + path);
-    auto w4 = [&](uint32_t v){ std::fwrite(&v,4,1,f); };
-    auto w2 = [&](uint16_t v){ std::fwrite(&v,2,1,f); };
-    auto ws = [&](const char* s, size_t n){ std::fwrite(s,1,n,f); };
-    ws("RIFF",4); w4(chksz); ws("WAVE",4);
-    ws("fmt ",4); w4(16); w2(1u); w2(2u);  // 2 channels
-    w4((uint32_t)sample_rate);
-    w4((uint32_t)(sample_rate * 4));  // byte rate: sr * channels * bytes_per_sample
-    w2(4u);   // block align: 2 channels * 2 bytes
-    w2(16u);
-    ws("data",4); w4(dsz);
-    std::fwrite(pcm.data(),2,pcm.size(),f);
+    detail::write_wav_impl(f, pcm, sample_rate, 2);
     std::fclose(f);
 }
 
@@ -1696,6 +2178,25 @@ public:
         return volume_.load(std::memory_order_relaxed);
     }
 
+    /// Returns the current playback position in seconds.
+    double position_seconds() const noexcept {
+        const size_t pos = position_.load(std::memory_order_relaxed);
+        return static_cast<double>(pos) / (sample_rate_ * channels_);
+    }
+
+    /// Total duration of the buffer in seconds.
+    double duration_seconds() const noexcept {
+        return static_cast<double>(pcm_.size()) / (sample_rate_ * channels_);
+    }
+
+    /// Seek to `seconds` into the buffer.  Clamped to [0, duration].
+    void seek(double seconds) noexcept {
+        const size_t target = static_cast<size_t>(
+            std::max(0.0, seconds) * sample_rate_ * channels_);
+        position_.store(std::min(target, pcm_.size()), std::memory_order_relaxed);
+        seek_pending_.store(true, std::memory_order_release);
+    }
+
     // ---- Worker entry point ----
     // Called once from the worker thread spawned by PlaybackRuntime.
 
@@ -1715,10 +2216,12 @@ private:
     int                  channels_;
 
     // Atomic flags - readable from any thread without locking
-    std::atomic<bool>  stopped_;
-    std::atomic<bool>  paused_;
-    std::atomic<bool>  playing_;
-    std::atomic<float> volume_;
+    std::atomic<bool>   stopped_;
+    std::atomic<bool>   paused_;
+    std::atomic<bool>   playing_;
+    std::atomic<float>  volume_;
+    std::atomic<size_t> position_{0};       ///< Current read position (in PCM samples)
+    std::atomic<bool>   seek_pending_{false}; ///< Worker re-reads position_ when true
 
     // Pause mechanism
     std::mutex              pause_mtx_;
@@ -1770,7 +2273,7 @@ private:
 
         const size_t chunk_samples = CHUNK_FRAMES * static_cast<size_t>(channels_);
         std::vector<int16_t> chunk(chunk_samples);
-        size_t pos = 0;
+        size_t pos = position_.load(std::memory_order_relaxed);
 
         while (pos < pcm_.size()) {
             // Honour stop
@@ -1782,6 +2285,12 @@ private:
                 if (stopped_.load(std::memory_order_acquire)) break;
             }
 
+            // Honour seek
+            if (seek_pending_.load(std::memory_order_acquire)) {
+                pos = position_.load(std::memory_order_relaxed);
+                seek_pending_.store(false, std::memory_order_release);
+            }
+
             const size_t remaining = pcm_.size() - pos;
             const size_t n         = remaining < chunk_samples ? remaining : chunk_samples;
 
@@ -1790,6 +2299,7 @@ private:
 
             if (std::fwrite(chunk.data(), sizeof(int16_t), n, pipe) != n) break;
             pos += n;
+            position_.store(pos, std::memory_order_relaxed);
         }
 
         pclose(pipe);
@@ -1837,7 +2347,7 @@ private:
             waveOutPrepareHeader(hwo, &hdrs[b], sizeof(WAVEHDR));
         }
 
-        size_t pos  = 0;
+        size_t pos  = position_.load(std::memory_order_relaxed);
         int    slot = 0;
 
         while (pos < pcm_.size()) {
@@ -1846,6 +2356,12 @@ private:
                 // Wait while paused, but don't block WaveOut - let it drain
                 wait_while_paused();
                 if (stopped_.load(std::memory_order_acquire)) break;
+            }
+
+            // Honour seek
+            if (seek_pending_.load(std::memory_order_acquire)) {
+                pos = position_.load(std::memory_order_relaxed);
+                seek_pending_.store(false, std::memory_order_release);
             }
 
             WAVEHDR& hdr = hdrs[slot];
@@ -1871,6 +2387,7 @@ private:
             waveOutWrite(hwo, &hdr, sizeof(WAVEHDR));
 
             pos  += n;
+            position_.store(pos, std::memory_order_relaxed);
             slot  = 1 - slot;
         }
 
@@ -1975,6 +2492,19 @@ public:
 
     /// Set output volume multiplier [0.0, 2.0].  Thread-safe.
     void set_volume(float v) { if (inst_) inst_->set_volume(v); }
+
+    /// Current playback position in seconds.
+    double position_seconds() const noexcept {
+        return inst_ ? inst_->position_seconds() : 0.0;
+    }
+
+    /// Total buffer duration in seconds.
+    double duration_seconds() const noexcept {
+        return inst_ ? inst_->duration_seconds() : 0.0;
+    }
+
+    /// Seek to `seconds`.  Best-effort: the worker honours it between chunks.
+    void seek(double seconds) { if (inst_) inst_->seek(seconds); }
 
     /// Block the calling thread until playback finishes (or is stopped).
     void wait() const {
