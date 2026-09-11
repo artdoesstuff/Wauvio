@@ -1,4 +1,4 @@
-# Wauvio
+# Wauvio-CPP
 
 A C++17 (or newer) audio synthesis engine and music framework. What started as a single synthesis header grew into three distinct layers that build on each other.
 
