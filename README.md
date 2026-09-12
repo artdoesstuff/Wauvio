@@ -176,13 +176,13 @@ auto music = wauvio::track::load_midi("music.mid", opts);
 
 music.set_instrument<wauvio::instruments::SoloViolin>(0);
 ```
-Overrides work at the level of the specific program, a specific percussion note, a whole channel, or just swap out a part's instrument after the fact.
+Overrides work at the level of the specific program, a specific percussion note, a whole channel, or just swapping out a part's instrument after the fact.
 
 Bad input gets an error instead of crashing: missing file, broken header, truncated data, corrupt variable-length values, invalid running status; those things throw a `wauvio::midi::MidiParseError` with a message that tells you exactly what went wrong.
 
 # Wauvio SoundFont (`wauvio_sf2`)
 
-Every instrument in `wauvio_ext` sounds fine out of the box through synthesis, but if you have a real SoundFont (`.sf2`) file and want actual recorded instrument samples instead, this loads one directly into the same `SampledInstrument`/`MultiSample` machinery the rest of the library already uses -- it's not a separate sample engine bolted on the side.
+Every instrument in `wauvio_ext` sounds fine out of the box through synthesis, but if you have a real SoundFont (`.sf2`) file and want actual recorded instrument samples instead, this loads one directly into the same `SampledInstrument`/`MultiSample` machinery the rest of the library already uses; it's not a separate sample engine bolted on the side.
 
 ```cpp
 #include "wauvio.hpp"
@@ -194,7 +194,7 @@ auto piano = sf.create_instrument(/*bank=*/0, /*bank_lsb=*/0, /*program=*/0);
 auto note = piano->play(60, 2.0);
 ```
 
-It parses the actual RIFF/hydra structure (INFO, sample data, presets, instruments, zones, generators -- all of it), not just enough to fake a preset list. Key/velocity ranges, root key, coarse/fine tune, pan, attenuation, loop points and loop mode, the volume envelope, and the low-pass filter generators all get resolved (including the preset-level generators that are meant to add on top of the instrument-level ones, per the SF2 spec) into a real `SampleZone` per sample region. All the sample audio for one loaded SoundFont is decoded once and shared (via `shared_ptr`) across every instrument and zone built from it, so loading a big font and pulling a dozen instruments out of it doesn't duplicate megabytes of PCM data a dozen times over.
+It parses the actual RIFF/hydra structure (INFO, sample data, presets, instruments, zones, generators; all of it), not just enough to fake a preset list. Key/velocity ranges, root key, coarse/fine tune, pan, attenuation, loop points and loop mode, the volume envelope, and the low-pass filter generators all get resolved (including the preset-level generators that are meant to add on top of the instrument-level ones, per the SF2 spec) into a real `SampleZone` per sample region. All the sample audio for one loaded SoundFont is decoded once and shared (via `shared_ptr`) across every instrument and zone built from it, so loading a big font and pulling a dozen instruments out of it doesn't duplicate megabytes of PCM data a dozen times over.
 
 To use it with the MIDI loader so a `.mid` file automatically plays through real samples wherever a matching preset exists:
 
@@ -206,7 +206,7 @@ auto music = wauvio::track::load_midi("song.mid", opts);
 wauvio::play(music);
 ```
 
-If a bank/program isn't in the font, resolution just falls back to the normal synthesized GM instrument -- nothing breaks, it just sounds like it did before you had a SoundFont.
+If a bank/program isn't in the font, resolution just falls back to the normal synthesised GM instrument; nothing breaks, it just sounds like it did before you had a SoundFont.
 
 Percussion works the same way: `sf.create_percussion_instrument(bank, bank_lsb, gm_note)` finds a drum kit preset (GM convention: bank 128, falling back to 120) and builds an instrument from it.
 
@@ -227,7 +227,7 @@ wauvio::render(arrangement, "song.wav", opts);
 wauvio::render(midi_music, "song.wav", opts);
 ```
 
-Multithreaded rendering only parallelizes the independent per-track/per-part synthesis step; the actual mixdown always happens afterward, single-threaded, in a fixed order -- so `worker_threads = 1` and `worker_threads = 8` produce bit-identical output. That's true throughout the library: noise generators are seeded from the note itself rather than any global RNG state, so the same input always renders the same audio regardless of thread count.
+Multithreaded rendering only parallelises the independent per-track/per-part synthesis step; the actual mixdown always happens afterwards, single-threaded, in a fixed order; so `worker_threads = 1` and `worker_threads = 8` produce bit-identical output. That's true throughout the library: noise generators are seeded from the note itself rather than any global RNG state, so the same input always renders the same audio regardless of thread count.
 
 Rendering each part to its own file:
 
@@ -236,7 +236,7 @@ auto music = wauvio::track::load_midi("song.mid");
 wauvio::track::render_stems(music, "output/stems/");
 ```
 
-Each stem is rendered through the exact same instrument, controllers, and timing it would get in the normal mix -- it's just isolated rather than left out.
+Each stem is rendered through the exact same instrument, controllers, and timing it would get in the normal mix; it's just isolated rather than left out.
 
 And the reverse direction -- writing a real, standards-compliant `.mid` file back out from something you built or loaded:
 
@@ -260,7 +260,7 @@ For a `MidiMusic` that was loaded with `retain_raw_midi` on (the default), the o
   note-on. A held note that gets bent up and back down mid-note actually
   sweeps; the MIDI loader builds this automatically from every pitch-bend
   message that occurs while a note is held.
-- There's a small generic modulation system (`ModRoute`) on synthesized
+- There's a small generic modulation system (`ModRoute`) on synthesised
   instruments' `TimbreRecipe` — velocity/mod-wheel/aftertouch/expression/
   key-position/LFOs routed to pitch, filter cutoff, volume, vibrato depth,
   or tremolo depth. It's meant to stay simple; it's not a full modular
