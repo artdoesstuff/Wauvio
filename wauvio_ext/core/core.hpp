@@ -126,10 +126,6 @@ struct Note {
     int          glide_from_midi     = -1;
     double       glide_time          = 0.08;
 
-    /// Continuous pitch-bend curve: (time_since_note_start_sec, semitone_offset)
-    /// pairs, linearly interpolated. Empty means "use the constant
-    /// pitch_bend_semitones value for the whole note" (fully backward
-    /// compatible with code that only sets pitch_bend_semitones).
     std::vector<std::pair<double,double>> pitch_bend_curve;
 
     double       mod_wheel   = 0.0;
@@ -326,10 +322,6 @@ protected:
 
 using InstrumentPtr = std::shared_ptr<Instrument>;
 
-/// Generic interface for an externally-loaded instrument bank (e.g. a
-/// SoundFont) so that consumers such as the MIDI resolver can prefer real
-/// sampled presets over the built-in synthesized fallback when available,
-/// without wauvio_ext needing to know anything about MIDI or SF2 specifics.
 class IBankProvider {
 public:
     virtual ~IBankProvider() = default;

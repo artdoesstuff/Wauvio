@@ -10,9 +10,6 @@ namespace midi {
 
 using InstrumentFactory = std::function<InstrumentPtr()>;
 
-/// Combines bank MSB/LSB and program number into a single lookup key.
-/// Bank 0/0 is plain GM; anything else is treated as a banked (GS/XG-style)
-/// instrument identity that a soundfont or explicit override can resolve.
 struct BankProgram {
     int bank_msb = 0;
     int bank_lsb = 0;
@@ -30,9 +27,6 @@ struct BankProgramHash {
     }
 };
 
-/// Optional interface a loaded soundfont (or any other instrument bank)
-/// can implement so the MIDI resolver can prefer real sampled instruments
-/// over the built-in synthesized GM fallback when available.
 using IBankProvider = audio::IBankProvider;
 
 class InstrumentResolver {
@@ -60,9 +54,6 @@ public:
         percussion_overrides_.clear();
     }
 
-    /// Attach a soundfont (or any IBankProvider) so banked/GM instrument
-    /// lookups can prefer real sampled presets when one exists, falling
-    /// back to the built-in synthesized instruments otherwise.
     void set_bank_provider(std::shared_ptr<IBankProvider> provider) { bank_provider_ = std::move(provider); }
     std::shared_ptr<IBankProvider> bank_provider() const { return bank_provider_; }
 

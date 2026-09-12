@@ -1,12 +1,13 @@
-# Wauvio
+# Wauvio-CPP
 
 A C++17 (or newer) audio synthesis engine and music framework. What started as a single synthesis header grew into three distinct layers that build on each other.
 
 * `wauvio.hpp` - the actual audio engine. Oscillators, FM synthesis, filters, envelopes, reverb/chorus/delay/distortion/EQ, mixing, WAV export, playback. This is where all the samples are generated.
 * `wauvio_ext/` - a higher-level layer on top of the existing engine. Instead of hand-wiring oscillators and envelopes, and manually writing instruments every time you want to produce a sound, you get 300+ pre-made instruments, ready to be instantiated and played, plus notes/chords/melodies/tracks/arrangements to compose with.
 * `wauvio_midi/` - loads a standard MIDI binary and turns it into playable Wauvio audio on its own. Simply point to a `*.mid` file, and let it do the rest.
+* `wauvio_sf2/` - loads a real SoundFont 2 (`.sf2`) bank and turns its presets into the same kind of sampled instrument the rest of the library already uses, so a MIDI file can play back through actual recorded instrument samples instead of the built-in synthesized fallback.
 
-Each layer only ends up depending on the one below it. `wauvio.hpp` never gets touched by the other two (abstractions); if you're already using it directly, absolutely nothing would change for you.
+Each layer only ends up depending on the one below it (`wauvio_sf2` and `wauvio_midi` both sit on top of `wauvio_ext`, and can be combined together, but neither depends on the other). `wauvio.hpp` never gets touched by anything above it; if you're already using it directly, absolutely nothing would change for you.
 
 ## In this repository
 
@@ -14,14 +15,16 @@ Each layer only ends up depending on the one below it. `wauvio.hpp` never gets t
 wauvio.hpp
 wauvio_ext.hpp
 wauvio_midi.hpp
+wauvio_sf2.hpp
 wauvio_ext/
 wauvio_midi/
+wauvio_sf2/
 ```
-Yeah, that's it. Examples and demos will be accessible [here](https://github.com/artdoesstuff/Wauvio/tree/wauvio-test-branch/worthy) (old branch), but as it stands, only the framework itself will remain here. However, if the examples/demos are too overwhelming at a glance, you can start writing it yourself almost immediately (it's like 3 lines, see below).
+Yeah, that's it. Examples and demos will be accessible [here](https://github.com/artdoesstuff-ex/Wauvio-Graveyard), but as it stands, only the framework itself will remain here. However, if the examples/demos are too overwhelming at a glance, you can start writing it yourself almost immediately (it's like 3 lines, see below).
 
 ## Requirements
 
-C++17 (or newer), and that's literally it. I specifically ensured not to include any external dependencies, nothing to link, nothing to install. Everything you'd need is inside the headers.
+C++17 (or newer), and that's literally it. I specifically ensured not to include any external dependencies, nothing to link, nothing to install. Everything you'd need is inside the headers. The one exception: parallel rendering uses `std::thread`, so on Linux/GCC you'll want `-pthread` on the compile line if you use it (single-threaded rendering doesn't need it).
 
 ## Usage
 
@@ -34,6 +37,7 @@ then copy (or move) the files into your project, and then just include what you 
 #include "wauvio.hpp"       // needed no matter what
 #include "wauvio_ext.hpp"   // instruments / notes / tracks
 #include "wauvio_midi.hpp"  // only if you're loading MIDI files
+#include "wauvio_sf2.hpp"   // only if you're loading SF2 samples
 ```
 
 Compile with C++17 (or newer). There are no extra steps beyond compiling your own `*.cpp` file.
@@ -176,6 +180,73 @@ Overrides work at the level of the specific program, a specific percussion note,
 
 Bad input gets an error instead of crashing: missing file, broken header, truncated data, corrupt variable-length values, invalid running status; those things throw a `wauvio::midi::MidiParseError` with a message that tells you exactly what went wrong.
 
+# Wauvio SoundFont (`wauvio_sf2`)
+
+Every instrument in `wauvio_ext` sounds fine out of the box through synthesis, but if you have a real SoundFont (`.sf2`) file and want actual recorded instrument samples instead, this loads one directly into the same `SampledInstrument`/`MultiSample` machinery the rest of the library already uses -- it's not a separate sample engine bolted on the side.
+
+```cpp
+#include "wauvio.hpp"
+#include "wauvio_ext.hpp"
+#include "wauvio_sf2.hpp"
+
+wauvio::sf2::SoundFont sf("GeneralUser.sf2");
+auto piano = sf.create_instrument(/*bank=*/0, /*bank_lsb=*/0, /*program=*/0);
+auto note = piano->play(60, 2.0);
+```
+
+It parses the actual RIFF/hydra structure (INFO, sample data, presets, instruments, zones, generators -- all of it), not just enough to fake a preset list. Key/velocity ranges, root key, coarse/fine tune, pan, attenuation, loop points and loop mode, the volume envelope, and the low-pass filter generators all get resolved (including the preset-level generators that are meant to add on top of the instrument-level ones, per the SF2 spec) into a real `SampleZone` per sample region. All the sample audio for one loaded SoundFont is decoded once and shared (via `shared_ptr`) across every instrument and zone built from it, so loading a big font and pulling a dozen instruments out of it doesn't duplicate megabytes of PCM data a dozen times over.
+
+To use it with the MIDI loader so a `.mid` file automatically plays through real samples wherever a matching preset exists:
+
+```cpp
+auto sf = std::make_shared<wauvio::sf2::SoundFont>("GeneralUser.sf2");
+wauvio::track::LoadOptions opts;
+opts.resolver.set_bank_provider(sf);
+auto music = wauvio::track::load_midi("song.mid", opts);
+wauvio::play(music);
+```
+
+If a bank/program isn't in the font, resolution just falls back to the normal synthesized GM instrument -- nothing breaks, it just sounds like it did before you had a SoundFont.
+
+Percussion works the same way: `sf.create_percussion_instrument(bank, bank_lsb, gm_note)` finds a drum kit preset (GM convention: bank 128, falling back to 120) and builds an instrument from it.
+
+Known limits: modulators are read but not wired into a live MIDI-CC-driven routing graph yet (velocity's effect on loudness works through the normal note-velocity path, not the SF2 modulator table specifically); exclusive classes are parsed and stored on each zone but not yet enforced (a hi-hat preset with open/closed choke groups won't actually choke each other); and bank LSB is accepted but SF2's own single `wBank` field is matched against bank MSB only, since that's what the format actually stores.
+
+# Rendering
+
+The basic `render()`/`play()` methods on instruments, tracks, arrangements, and `MidiMusic` still work exactly as before. For more control over the output file itself, there's `RenderOptions`:
+
+```cpp
+wauvio::RenderOptions opts;
+opts.bit_depth = 24;
+opts.dither = wauvio::DitherType::Triangular;
+opts.render_tail_sec = 2.0;       // pad silence at the end (reverb tails etc.)
+opts.worker_threads = 0;          // 0 = auto-detect, 1 = single-threaded
+
+wauvio::render(arrangement, "song.wav", opts);
+wauvio::render(midi_music, "song.wav", opts);
+```
+
+Multithreaded rendering only parallelizes the independent per-track/per-part synthesis step; the actual mixdown always happens afterward, single-threaded, in a fixed order -- so `worker_threads = 1` and `worker_threads = 8` produce bit-identical output. That's true throughout the library: noise generators are seeded from the note itself rather than any global RNG state, so the same input always renders the same audio regardless of thread count.
+
+Rendering each part to its own file:
+
+```cpp
+auto music = wauvio::track::load_midi("song.mid");
+wauvio::track::render_stems(music, "output/stems/");
+```
+
+Each stem is rendered through the exact same instrument, controllers, and timing it would get in the normal mix -- it's just isolated rather than left out.
+
+And the reverse direction -- writing a real, standards-compliant `.mid` file back out from something you built or loaded:
+
+```cpp
+wauvio::track::save_midi(arrangement, "output.mid");   // from an Arrangement you composed
+wauvio::track::save_midi(music, "output.mid");         // from a loaded/edited MidiMusic
+```
+
+For a `MidiMusic` that was loaded with `retain_raw_midi` on (the default), the original tempo map is reproduced exactly rather than flattened to one BPM. One honest limitation: `Arrangement` tracks are built from `wauvio_ext` `Instrument` objects, not GM program numbers, so there's no reliable way to know what GM instrument a given `Instrument` "is" -- exported Arrangement tracks all get program 0. Note pitch, timing, duration, velocity, and channel all round-trip correctly either way (verified: reloading a re-exported file reproduces the exact same note count and sub-millisecond-accurate timing as the original).
+
 ## Some extra notes
 
 - Nothing lower in the stack knows or cares about anything higher up.
@@ -185,3 +256,12 @@ Bad input gets an error instead of crashing: missing file, broken header, trunca
   upgrade from synthesised to sampled) without rewriting anything.
 - "Automatic" doesn't mean "no say in the matter." Every decision the MIDI
   loader makes on your behalf can be overridden.
+- Pitch bend is a real continuous curve now, not a single value sampled at
+  note-on. A held note that gets bent up and back down mid-note actually
+  sweeps; the MIDI loader builds this automatically from every pitch-bend
+  message that occurs while a note is held.
+- There's a small generic modulation system (`ModRoute`) on synthesized
+  instruments' `TimbreRecipe` — velocity/mod-wheel/aftertouch/expression/
+  key-position/LFOs routed to pitch, filter cutoff, volume, vibrato depth,
+  or tremolo depth. It's meant to stay simple; it's not a full modular
+  synth graph.

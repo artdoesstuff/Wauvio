@@ -24,12 +24,8 @@ inline std::string sanitize_filename(const std::string& name) {
     return out;
 }
 
-} // namespace detail
+}
 
-/// Renders every part of a MidiMusic, optionally in parallel, and returns
-/// the deterministic full mix. Parts are always combined in a fixed order
-/// regardless of which worker thread finishes first, so this produces
-/// bit-identical output to MidiMusic::render() at worker_threads=1.
 inline StereoBuffer render_to_buffer(const MidiMusic& music, const RenderOptions& opts = RenderOptions()) {
     auto prior_quality = audio::default_interpolation_quality();
     audio::default_interpolation_quality() = opts.interpolation;
@@ -69,12 +65,6 @@ inline StereoBuffer render_to_buffer(const MidiMusic& music, const RenderOptions
     return mix;
 }
 
-/// Renders each part to its own WAV file in `output_dir`, using the same
-/// instrument assignment, controllers, and timing as the normal mix -- so
-/// each stem sounds exactly like that part's contribution to render().
-/// Per-stem files are NOT independently peak-normalized against each other
-/// (that would destroy the relative balance between stems); only the
-/// requested bit depth/dither/tail are applied per file.
 inline std::vector<std::string> render_stems(const MidiMusic& music, const std::string& output_dir,
                                               const RenderOptions& opts = RenderOptions())
 {
@@ -123,7 +113,7 @@ inline std::vector<std::string> render_stems(const MidiMusic& music, const std::
     return written_paths;
 }
 
-} // namespace track
+}
 
 inline void render(const track::MidiMusic& music, const std::string& path, const RenderOptions& opts = RenderOptions()) {
     StereoBuffer buf = track::render_to_buffer(music, opts);
@@ -132,4 +122,4 @@ inline void render(const track::MidiMusic& music, const std::string& path, const
                                      opts.seed, opts.deterministic_seed_enabled);
 }
 
-} // namespace wauvio
+}

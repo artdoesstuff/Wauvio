@@ -56,7 +56,7 @@ inline audio::Dynamics velocity_to_dynamics_u8(uint8_t v) {
     return audio::velocity_to_dynamics(static_cast<double>(v) / 127.0);
 }
 
-} // namespace detail
+}
 
 inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = LoadOptions()) {
     midi::ParsedMidiFile parsed = midi::parse_midi_file(path);
@@ -299,5 +299,5 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
     return music;
 }
 
-} // namespace track
-} // namespace wauvio
+}
+}

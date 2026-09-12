@@ -121,7 +121,7 @@ inline void write_file(const std::string& path, uint16_t format, uint16_t ntrks,
     f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
 }
 
-} // namespace writer_detail
+}
 
 inline void save_midi(const audio::Arrangement& arr, const std::string& path, int ppq = 480) {
     using namespace writer_detail;
@@ -217,5 +217,5 @@ inline void save_midi(const MidiMusic& music, const std::string& path) {
     write_file(path, 1, static_cast<uint16_t>(chunks.size()), static_cast<uint16_t>(ppq), chunks);
 }
 
-} // namespace track
-} // namespace wauvio
+}
+}

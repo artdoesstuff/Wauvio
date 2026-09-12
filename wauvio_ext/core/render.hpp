@@ -124,7 +124,7 @@ inline void write_wav_custom(const StereoBuffer& buf, const std::string& path, i
     std::fclose(f);
 }
 
-} // namespace render_detail
+}
 
 inline void apply_render_options(StereoBuffer& buf, const RenderOptions& opts) {
     if (opts.render_tail_sec > 0.0) {
@@ -157,11 +157,6 @@ inline void render(const StereoBuffer& buf_in, const std::string& path, const Re
 
 namespace audio {
 
-/// Renders every track of an Arrangement -- optionally in parallel, always
-/// combined back together in a fixed, deterministic order -- and applies
-/// the Arrangement's own master reverb/limiter. Equivalent in output to
-/// Arrangement::render() but exposes the full RenderOptions surface
-/// (bit depth, dithering, tail, loop count, normalization control).
 inline StereoBuffer render_to_buffer(const Arrangement& arr, const RenderOptions& opts = RenderOptions()) {
     auto prior_quality = default_interpolation_quality();
     default_interpolation_quality() = opts.interpolation;
@@ -206,7 +201,7 @@ inline StereoBuffer render_to_buffer(const Arrangement& arr, const RenderOptions
     return out;
 }
 
-} // namespace audio
+}
 
 inline void render(const audio::Arrangement& arr, const std::string& path, const RenderOptions& opts = RenderOptions()) {
     StereoBuffer buf = audio::render_to_buffer(arr, opts);
@@ -215,4 +210,4 @@ inline void render(const audio::Arrangement& arr, const std::string& path, const
                                      opts.seed, opts.deterministic_seed_enabled);
 }
 
-} // namespace wauvio
+}

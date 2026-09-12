@@ -42,8 +42,6 @@ public:
         }
     }
 
-    /// SMPTE-divided files use a fixed linear tick->time mapping (tempo
-    /// meta events do not apply, per the Standard MIDI File spec).
     void finalize_smpte(int fps, int ticks_per_frame) {
         smpte_mode_ = true;
         smpte_seconds_per_tick_ = 1.0 / (static_cast<double>(fps) * static_cast<double>(ticks_per_frame));
