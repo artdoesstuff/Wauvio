@@ -238,14 +238,14 @@ wauvio::track::render_stems(music, "output/stems/");
 
 Each stem is rendered through the exact same instrument, controllers, and timing it would get in the normal mix; it's just isolated rather than left out.
 
-And the reverse direction -- writing a real, standards-compliant `.mid` file back out from something you built or loaded:
+And the reverse direction: writing a real, standards-compliant `.mid` file back out from something you built or loaded:
 
 ```cpp
 wauvio::track::save_midi(arrangement, "output.mid");   // from an Arrangement you composed
 wauvio::track::save_midi(music, "output.mid");         // from a loaded/edited MidiMusic
 ```
 
-For a `MidiMusic` that was loaded with `retain_raw_midi` on (the default), the original tempo map is reproduced exactly rather than flattened to one BPM. One honest limitation: `Arrangement` tracks are built from `wauvio_ext` `Instrument` objects, not GM program numbers, so there's no reliable way to know what GM instrument a given `Instrument` "is" -- exported Arrangement tracks all get program 0. Note pitch, timing, duration, velocity, and channel all round-trip correctly either way (verified: reloading a re-exported file reproduces the exact same note count and sub-millisecond-accurate timing as the original).
+For a `MidiMusic` that was loaded with `retain_raw_midi` on (the default), the original tempo map is reproduced exactly rather than flattened to one BPM. One honest limitation: `Arrangement` tracks are built from `wauvio_ext` `Instrument` objects, not GM program numbers, so there's no reliable way to know what GM instrument a given `Instrument` "is"; exported Arrangement tracks all get program 0. Note pitch, timing, duration, velocity, and channel all round-trip correctly either way (verified: reloading a re-exported file reproduces the exact same note count and sub-millisecond-accurate timing as the original).
 
 ## Some extra notes
 
