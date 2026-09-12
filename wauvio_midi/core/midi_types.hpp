@@ -41,6 +41,8 @@ struct ParsedMidiFile {
     uint16_t declared_track_count = 0;
     uint16_t division = 480;
     bool smpte_timing = false;
+    int smpte_fps = 30;
+    int smpte_ticks_per_frame = 80;
     std::vector<ParsedTrack> tracks;
 };
 

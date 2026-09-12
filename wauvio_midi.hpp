@@ -13,5 +13,7 @@
 
 #include "wauvio_midi/track/midi_music.hpp"
 #include "wauvio_midi/track/loader.hpp"
+#include "wauvio_midi/track/render.hpp"
+#include "wauvio_midi/track/midi_writer.hpp"
 
 #include "wauvio_midi/playback.hpp"

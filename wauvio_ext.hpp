@@ -5,6 +5,7 @@
 #include "wauvio_ext/core/core.hpp"
 #include "wauvio_ext/samples/sampling.hpp"
 #include "wauvio_ext/core/model_instruments.hpp"
+#include "wauvio_ext/core/render.hpp"
 
 #include "wauvio_ext/instruments/keyboards/keyboards.hpp"
 #include "wauvio_ext/instruments/strings/strings.hpp"

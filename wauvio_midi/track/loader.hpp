@@ -4,9 +4,11 @@
 #include "../core/midi_parser.hpp"
 #include "../core/tempo_map.hpp"
 
+#include <algorithm>
 #include <array>
 #include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 
 namespace wauvio {
@@ -18,18 +20,24 @@ struct LoadOptions {
     bool honor_portamento = true;
     double pitch_bend_range_semitones = 2.0;
     double default_glide_time = 0.08;
+    bool retain_raw_midi = true;
 };
 
 namespace detail {
 
 struct ChannelState {
     int program = 0;
+    int bank_msb = 0;
+    int bank_lsb = 0;
     bool sustain_on = false;
     bool portamento_on = false;
     double pitch_bend_semitones = 0.0;
+    double pitch_bend_range_semitones = 2.0;
     double expression = 1.0;
     double volume = 1.0;
     int last_note_on_pitch = -1;
+    int rpn_msb = 0x7F;
+    int rpn_lsb = 0x7F;
 };
 
 struct HeldNote {
@@ -39,6 +47,8 @@ struct HeldNote {
     double bend_at_onset = 0.0;
     int glide_from_midi = -1;
     int program_at_onset = 0;
+    int bank_msb_at_onset = 0;
+    int bank_lsb_at_onset = 0;
     bool pending_pedal_release = false;
 };
 
@@ -46,7 +56,7 @@ inline audio::Dynamics velocity_to_dynamics_u8(uint8_t v) {
     return audio::velocity_to_dynamics(static_cast<double>(v) / 127.0);
 }
 
-}
+} // namespace detail
 
 inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = LoadOptions()) {
     midi::ParsedMidiFile parsed = midi::parse_midi_file(path);
@@ -81,22 +91,50 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
             }
         }
     }
-    tempo_map.finalize(parsed.division);
+
+    if (parsed.smpte_timing) tempo_map.finalize_smpte(parsed.smpte_fps, parsed.smpte_ticks_per_frame);
+    else tempo_map.finalize(parsed.division);
 
     MidiMusic music;
     music.source_path = path;
     music.initial_bpm = tempo_map.bpm_at_start();
     music.duration_seconds = tempo_map.tick_to_seconds(max_tick);
     music.ticks_per_quarter = parsed.division;
+    music.smpte_timing = parsed.smpte_timing;
     music.time_signatures = std::move(time_sigs);
     music.key_signatures = std::move(key_sigs);
+
+    using PartKey = std::tuple<int,int,int,int>; // channel, bank_msb, bank_lsb, program
 
     for (size_t ti = 0; ti < parsed.tracks.size(); ++ti) {
         const midi::ParsedTrack& raw_track = parsed.tracks[ti];
         std::array<detail::ChannelState, 16> chan_state{};
+        for (auto& cs : chan_state) cs.pitch_bend_range_semitones = opts.pitch_bend_range_semitones;
         std::array<bool, 16> channel_saw_program_change{};
         std::array<std::map<int, detail::HeldNote>, 16> held_notes{};
-        std::map<std::pair<int, int>, std::vector<ResolvedNote>> notes_by_channel_program;
+        std::array<std::vector<std::pair<uint64_t,double>>, 16> bend_history{};
+        std::map<PartKey, std::vector<ResolvedNote>> notes_by_key;
+
+        auto build_bend_curve = [&](int channel, uint64_t start_tick, uint64_t end_tick, double onset_bend) {
+            std::vector<std::pair<double,double>> curve;
+            auto& hist = bend_history[static_cast<size_t>(channel)];
+            if (hist.empty()) return curve;
+
+            auto it = std::lower_bound(hist.begin(), hist.end(), start_tick,
+                [](const std::pair<uint64_t,double>& e, uint64_t tick) { return e.first < tick; });
+
+            double t0 = tempo_map.tick_to_seconds(start_tick);
+            curve.emplace_back(0.0, onset_bend);
+            bool changed = false;
+            for (; it != hist.end() && it->first <= end_tick; ++it) {
+                double rel = tempo_map.tick_to_seconds(it->first) - t0;
+                if (rel < 0.0) rel = 0.0;
+                curve.emplace_back(rel, it->second);
+                changed = true;
+            }
+            if (!changed) curve.clear();
+            return curve;
+        };
 
         auto finalize_note = [&](int channel, int note, uint64_t end_tick, const detail::HeldNote& held) {
             double t0 = tempo_map.tick_to_seconds(held.start_tick);
@@ -110,8 +148,10 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
             rn.dyn = detail::velocity_to_dynamics_u8(held.velocity);
             rn.expression = held.expression_at_onset;
             rn.pitch_bend_semitones = held.bend_at_onset;
+            rn.pitch_bend_curve = build_bend_curve(channel, held.start_tick, end_tick, held.bend_at_onset);
             rn.glide_from_midi = held.glide_from_midi;
-            notes_by_channel_program[{channel, held.program_at_onset}].push_back(rn);
+            PartKey key{channel, held.bank_msb_at_onset, held.bank_lsb_at_onset, held.program_at_onset};
+            notes_by_key[key].push_back(std::move(rn));
         };
 
         for (const midi::MidiEvent& ev : raw_track.events) {
@@ -126,7 +166,11 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
                     break;
 
                 case midi::MidiEventType::ControlChange: {
-                    if (ev.data1 == 64) {
+                    if (ev.data1 == 0) {
+                        cs.bank_msb = ev.data2;
+                    } else if (ev.data1 == 32) {
+                        cs.bank_lsb = ev.data2;
+                    } else if (ev.data1 == 64) {
                         bool was_on = cs.sustain_on;
                         cs.sustain_on = ev.data2 >= 64;
                         if (opts.honor_sustain_pedal && was_on && !cs.sustain_on) {
@@ -145,6 +189,15 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
                         cs.expression = static_cast<double>(ev.data2) / 127.0;
                     } else if (ev.data1 == 7) {
                         cs.volume = static_cast<double>(ev.data2) / 127.0;
+                    } else if (ev.data1 == 101) {
+                        cs.rpn_msb = ev.data2;
+                    } else if (ev.data1 == 100) {
+                        cs.rpn_lsb = ev.data2;
+                    } else if (ev.data1 == 6 && cs.rpn_msb == 0 && cs.rpn_lsb == 0) {
+                        cs.pitch_bend_range_semitones = static_cast<double>(ev.data2);
+                    } else if (ev.data1 == 38 && cs.rpn_msb == 0 && cs.rpn_lsb == 0) {
+                        int whole = static_cast<int>(cs.pitch_bend_range_semitones);
+                        cs.pitch_bend_range_semitones = whole + static_cast<double>(ev.data2) / 100.0;
                     }
                     break;
                 }
@@ -152,7 +205,8 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
                 case midi::MidiEventType::PitchBend: {
                     int raw14 = (static_cast<int>(ev.data2) << 7) | static_cast<int>(ev.data1);
                     double normalized = (raw14 - 8192) / 8192.0;
-                    cs.pitch_bend_semitones = normalized * opts.pitch_bend_range_semitones;
+                    cs.pitch_bend_semitones = normalized * cs.pitch_bend_range_semitones;
+                    bend_history[ev.channel].emplace_back(ev.abs_tick, cs.pitch_bend_semitones);
                     break;
                 }
 
@@ -168,6 +222,8 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
                     hn.expression_at_onset = cs.expression * cs.volume;
                     hn.bend_at_onset = cs.pitch_bend_semitones;
                     hn.program_at_onset = cs.program;
+                    hn.bank_msb_at_onset = cs.bank_msb;
+                    hn.bank_lsb_at_onset = cs.bank_lsb;
                     hn.glide_from_midi = (opts.honor_portamento && cs.portamento_on &&
                                           cs.last_note_on_pitch >= 0 && cs.last_note_on_pitch != ev.data1)
                                              ? cs.last_note_on_pitch : -1;
@@ -198,9 +254,11 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
                 finalize_note(ch, note, max_tick, hn);
         }
 
-        for (auto& [key, notes] : notes_by_channel_program) {
-            const int channel = key.first;
-            const int program = key.second;
+        for (auto& [key, notes] : notes_by_key) {
+            const int channel = std::get<0>(key);
+            const int bank_msb = std::get<1>(key);
+            const int bank_lsb = std::get<2>(key);
+            const int program = std::get<3>(key);
             if (notes.empty()) continue;
             std::stable_sort(notes.begin(), notes.end(),
                               [](const ResolvedNote& a, const ResolvedNote& b) { return a.t < b.t; });
@@ -209,6 +267,8 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
             part.source_track_index = static_cast<int>(ti);
             part.channel = channel;
             part.gm_program = program;
+            part.bank_msb = bank_msb;
+            part.bank_lsb = bank_lsb;
             part.name = !raw_track.name.empty() ? raw_track.name
                                                  : ("Track" + std::to_string(ti) + "_Ch" + std::to_string(channel));
 
@@ -217,7 +277,7 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
                 auto kit = std::make_shared<audio::DrumKit>(part.name);
                 for (auto& rn : notes)
                     if (!kit->has(rn.midi_note))
-                        kit->map(rn.midi_note, opts.resolver.resolve_percussion(channel, rn.midi_note));
+                        kit->map(rn.midi_note, opts.resolver.resolve_percussion(channel, rn.midi_note, bank_msb, bank_lsb));
                 part.drum_kit = kit;
             } else {
                 int effective_program = program;
@@ -225,7 +285,7 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
                     int guessed = -1;
                     if (midi::guess_program_from_name(raw_track.name, guessed)) effective_program = guessed;
                 }
-                part.instrument = opts.resolver.resolve_melodic(channel, effective_program);
+                part.instrument = opts.resolver.resolve_melodic(channel, effective_program, bank_msb, bank_lsb);
             }
 
             part.notes = std::move(notes);
@@ -233,8 +293,11 @@ inline MidiMusic load_midi(const std::string& path, const LoadOptions& opts = Lo
         }
     }
 
+    if (opts.retain_raw_midi)
+        music.raw_midi = std::make_shared<midi::ParsedMidiFile>(std::move(parsed));
+
     return music;
 }
 
-}
-}
+} // namespace track
+} // namespace wauvio

@@ -71,7 +71,12 @@ inline ParsedMidiFile parse_midi_bytes(const std::vector<unsigned char>& bytes, 
     uint16_t division = r.u16be();
     if (division & 0x8000) {
         out.smpte_timing = true;
-        out.division = 480;
+        int fps_code = static_cast<int8_t>((division >> 8) & 0xFF);
+        int ticks_per_frame = division & 0xFF;
+        int fps = (fps_code == -24) ? 24 : (fps_code == -25) ? 25 : (fps_code == -29) ? 29 : 30;
+        out.smpte_fps = fps;
+        out.smpte_ticks_per_frame = ticks_per_frame > 0 ? ticks_per_frame : 80;
+        out.division = static_cast<uint16_t>(out.smpte_fps * out.smpte_ticks_per_frame);
     } else {
         out.division = division == 0 ? 480 : division;
     }
@@ -154,7 +159,15 @@ inline ParsedMidiFile parse_midi_bytes(const std::vector<unsigned char>& bytes, 
                 if (r.remaining() < len || r.position() + len > track_end)
                     throw MidiParseError("SysEx event length exceeds remaining track data in track " +
                                           std::to_string(t) + " of " + source_label);
-                r.skip(len);
+                std::vector<uint8_t> sysex_data(len);
+                for (uint32_t i = 0; i < len; ++i) sysex_data[i] = r.u8();
+
+                MidiEvent sysex_ev;
+                sysex_ev.abs_tick = abs_tick;
+                sysex_ev.type = MidiEventType::SysEx;
+                sysex_ev.meta_type = status;
+                sysex_ev.meta_data = std::move(sysex_data);
+                track.events.push_back(std::move(sysex_ev));
                 continue;
             }
 

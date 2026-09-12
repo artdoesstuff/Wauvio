@@ -52,6 +52,8 @@ struct TimbreRecipe {
     std::map<Articulation, double> art_noise_boost;
     std::map<Articulation, double> art_pitch_shift;
     std::map<Articulation, double> art_filter_scale;
+
+    std::vector<ModRoute> modulation;
 };
 
 inline StereoBuffer render_timbre(const TimbreRecipe& r, const Note& note, int sample_rate) {
@@ -89,8 +91,7 @@ inline StereoBuffer render_timbre(const TimbreRecipe& r, const Note& note, int s
 
     double base_freq = (r.fixed_pitch_hz >= 0.0)
         ? r.fixed_pitch_hz
-        : midi_to_freq(note.midi_note) * std::pow(2.0, pitch_shift_semi / 12.0)
-                                        * std::pow(2.0, note.pitch_bend_semitones / 12.0);
+        : midi_to_freq(note.midi_note) * std::pow(2.0, pitch_shift_semi / 12.0);
 
     const double velocity = dynamics_to_velocity(note.dynamics) * std::max(0.0, std::min(1.0, note.expression));
 
@@ -99,6 +100,29 @@ inline StereoBuffer render_timbre(const TimbreRecipe& r, const Note& note, int s
         ? 1200.0 * std::log2(midi_to_freq(note.glide_from_midi) / std::max(1.0, base_freq))
         : 0.0;
     const double glide_time = std::max(0.001, note.glide_time);
+
+    const bool has_continuous_bend = r.fixed_pitch_hz < 0.0;
+    const bool has_tremolo = (art == Articulation::Tremolo);
+
+    auto eval_mod_sum = [&](ModTarget target, double t) -> double {
+        double sum = 0.0;
+        for (auto& route : r.modulation) {
+            if (route.target != target) continue;
+            double src_val = 0.0;
+            switch (route.source) {
+                case ModSource::Velocity:    src_val = velocity; break;
+                case ModSource::ModWheel:    src_val = note.mod_wheel; break;
+                case ModSource::Aftertouch:  src_val = note.aftertouch; break;
+                case ModSource::Expression:  src_val = note.expression; break;
+                case ModSource::KeyPosition: src_val = note.midi_note / 127.0; break;
+                case ModSource::LFO1:        src_val = std::sin(TWO_PI * 5.0 * t); break;
+                case ModSource::LFO2:        src_val = std::sin(TWO_PI * 0.5 * t); break;
+                case ModSource::Envelope1:   src_val = (duration > 0.0) ? std::max(0.0, 1.0 - t / duration) : 0.0; break;
+            }
+            sum += src_val * route.amount;
+        }
+        return sum;
+    };
 
     Oscillator osc1(r.osc1_shape, base_freq, 1.0);
     Oscillator osc2(r.osc2_shape, base_freq * r.osc2_ratio * std::pow(2.0, r.detune_cents / 1200.0), 1.0);
@@ -121,6 +145,10 @@ inline StereoBuffer render_timbre(const TimbreRecipe& r, const Note& note, int s
         double t = static_cast<double>(i) / sample_rate;
 
         double pitch_mult = 1.0;
+        if (has_continuous_bend) {
+            double bend_semi = note.bend_at(t);
+            if (bend_semi != 0.0) pitch_mult *= std::pow(2.0, bend_semi / 12.0);
+        }
         if (has_glide && t < glide_time) {
             double f = 1.0 - (t / glide_time);
             pitch_mult *= std::pow(2.0, (glide_start_cents * f) / 1200.0);
@@ -129,16 +157,20 @@ inline StereoBuffer render_timbre(const TimbreRecipe& r, const Note& note, int s
             double f = 1.0 - (t / r.pitch_attack_time);
             pitch_mult *= std::pow(2.0, (r.pitch_attack_cents * f) / 1200.0);
         }
+        double vibrato_depth_scale = 1.0 + eval_mod_sum(ModTarget::VibratoDepth, t);
         if (r.vibrato_depth_cents > 0.0 && t > r.vibrato_delay_sec) {
             double vt = (t - r.vibrato_delay_sec);
             double lfo = std::sin(TWO_PI * r.vibrato_rate_hz * vt);
-            pitch_mult *= std::pow(2.0, (lfo * r.vibrato_depth_cents) / 1200.0);
+            pitch_mult *= std::pow(2.0, (lfo * r.vibrato_depth_cents * vibrato_depth_scale) / 1200.0);
         }
         if (r.pitch_instability > 0.0) {
             double target = drift_noise.tick_pink();
             drift += (target - drift) * 0.0004;
             pitch_mult *= std::pow(2.0, (drift * r.pitch_instability) / 1200.0);
         }
+        double mod_pitch_semi = eval_mod_sum(ModTarget::Pitch, t);
+        if (mod_pitch_semi != 0.0) pitch_mult *= std::pow(2.0, mod_pitch_semi / 12.0);
+
         osc1.frequency = base_freq * pitch_mult;
         osc2.frequency = base_freq * r.osc2_ratio * std::pow(2.0, r.detune_cents / 1200.0) * pitch_mult;
 
@@ -165,11 +197,21 @@ inline StereoBuffer render_timbre(const TimbreRecipe& r, const Note& note, int s
             sample = static_cast<float>(sample * (1.0 - std::min(1.0, n_amt)) + nz * std::min(1.0, n_amt));
         }
 
-        if (r.filter_env_amount != 0.0) {
-            double sweep = r.filter_env_amount * (1.0 - t / duration);
+        if (has_tremolo) {
+            double tremolo_depth = std::max(0.0, 0.5 + eval_mod_sum(ModTarget::TremoloDepth, t));
+            double tlfo = std::sin(TWO_PI * 8.0 * t);
+            sample = static_cast<float>(sample * (1.0 - tremolo_depth * 0.5 + tremolo_depth * 0.5 * tlfo));
+        }
+
+        double mod_filter_hz = eval_mod_sum(ModTarget::FilterCutoff, t);
+        if (r.filter_env_amount != 0.0 || mod_filter_hz != 0.0) {
+            double sweep = r.filter_env_amount * (1.0 - t / duration) + mod_filter_hz;
             filt.cutoff = std::max(60.0, r.filter_cutoff * filter_scale + sweep);
         }
         sample = filt.tick(sample, sample_rate);
+
+        double mod_volume = 1.0 + eval_mod_sum(ModTarget::Volume, t);
+        sample = static_cast<float>(sample * std::max(0.0, mod_volume));
 
         mono[i] = sample * static_cast<float>(velocity);
     }

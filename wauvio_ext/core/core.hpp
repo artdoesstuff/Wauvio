@@ -126,15 +126,65 @@ struct Note {
     int          glide_from_midi     = -1;
     double       glide_time          = 0.08;
 
+    /// Continuous pitch-bend curve: (time_since_note_start_sec, semitone_offset)
+    /// pairs, linearly interpolated. Empty means "use the constant
+    /// pitch_bend_semitones value for the whole note" (fully backward
+    /// compatible with code that only sets pitch_bend_semitones).
+    std::vector<std::pair<double,double>> pitch_bend_curve;
+
+    double       mod_wheel   = 0.0;
+    double       aftertouch  = 0.0;
+
     Note() = default;
     Note(int midi, double dur, Dynamics dyn = Dynamics::mf,
          Articulation art = Articulation::Sustain, double p = 0.0)
         : midi_note(midi), duration(dur), dynamics(dyn), articulation(art), pan(p) {}
 
     bool is_rest() const noexcept { return midi_note < 0; }
+
+    double bend_at(double t) const {
+        if (pitch_bend_curve.empty()) return pitch_bend_semitones;
+        if (t <= pitch_bend_curve.front().first) return pitch_bend_curve.front().second;
+        if (t >= pitch_bend_curve.back().first) return pitch_bend_curve.back().second;
+        for (size_t i = 1; i < pitch_bend_curve.size(); ++i) {
+            if (t <= pitch_bend_curve[i].first) {
+                double t0 = pitch_bend_curve[i-1].first, t1 = pitch_bend_curve[i].first;
+                double v0 = pitch_bend_curve[i-1].second, v1 = pitch_bend_curve[i].second;
+                double f = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0;
+                return v0 + (v1 - v0) * f;
+            }
+        }
+        return pitch_bend_curve.back().second;
+    }
 };
 
 inline Note rest(double duration) { return Note(REST_NOTE, duration); }
+
+enum class ModSource {
+    Velocity,
+    ModWheel,
+    Aftertouch,
+    Expression,
+    KeyPosition,
+    LFO1,
+    LFO2,
+    Envelope1
+};
+
+enum class ModTarget {
+    Pitch,
+    FilterCutoff,
+    Volume,
+    VibratoDepth,
+    TremoloDepth,
+    Pan
+};
+
+struct ModRoute {
+    ModSource source;
+    ModTarget target;
+    double    amount = 0.0;
+};
 
 struct Chord {
     std::vector<int> midi_notes;
@@ -276,8 +326,23 @@ protected:
 
 using InstrumentPtr = std::shared_ptr<Instrument>;
 
+/// Generic interface for an externally-loaded instrument bank (e.g. a
+/// SoundFont) so that consumers such as the MIDI resolver can prefer real
+/// sampled presets over the built-in synthesized fallback when available,
+/// without wauvio_ext needing to know anything about MIDI or SF2 specifics.
+class IBankProvider {
+public:
+    virtual ~IBankProvider() = default;
+    virtual bool has_preset(int bank_msb, int bank_lsb, int program) const = 0;
+    virtual InstrumentPtr create_instrument(int bank_msb, int bank_lsb, int program) const = 0;
+    virtual bool has_percussion_preset(int bank_msb, int bank_lsb, int gm_note) const = 0;
+    virtual InstrumentPtr create_percussion_instrument(int bank_msb, int bank_lsb, int gm_note) const = 0;
+};
+
 class Track {
 public:
+    std::string name;
+
     Track() = default;
     explicit Track(const Instrument& instr) : instrument_(&instr) {}
 
@@ -312,6 +377,19 @@ public:
 
     const Instrument* instrument() const { return instrument_; }
 
+    size_t entry_count() const noexcept { return entries_.size(); }
+    bool entry_is_chord(size_t i) const { return entries_.at(i).is_chord; }
+    const Note& entry_note(size_t i) const { return entries_.at(i).note; }
+    const Chord& entry_chord(size_t i) const { return entries_.at(i).chord; }
+
+    std::vector<double> entry_onsets() const {
+        std::vector<double> out;
+        out.reserve(entries_.size());
+        double t = 0.0;
+        for (auto& e : entries_) { out.push_back(t); t += e.note.duration; }
+        return out;
+    }
+
 private:
     struct Entry { Note note; bool is_chord = false; Chord chord = Chord({}, 0.0); };
     const Instrument*  instrument_ = nullptr;
@@ -341,6 +419,15 @@ public:
     Arrangement& master_reverb(float room = 0.5f, float wet = 0.2f) {
         master_reverb_on_ = true; master_reverb_.room_size = room; master_reverb_.wet = wet; return *this;
     }
+
+    size_t track_count() const noexcept { return tracks_.size(); }
+    const Track& track_at(size_t i) const { return *tracks_.at(i); }
+    double start_time_at(size_t i) const { return placements_.at(i).start_time; }
+    float gain_at(size_t i) const { return placements_.at(i).gain; }
+    bool has_limiter() const noexcept { return limiter_on_; }
+    float limiter_threshold() const noexcept { return limiter_threshold_; }
+    bool has_master_reverb() const noexcept { return master_reverb_on_; }
+    const Reverb& master_reverb_settings() const noexcept { return master_reverb_; }
 
     StereoBuffer render(int sample_rate = 0) const {
         if (sample_rate <= 0) sample_rate = global_config().sample_rate;

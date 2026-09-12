@@ -112,8 +112,18 @@ inline WavData load_wav(const std::string& path) {
     return out;
 }
 
+enum class InterpolationQuality { Nearest, Linear, Cubic };
+
+inline InterpolationQuality& default_interpolation_quality() {
+    static InterpolationQuality q = InterpolationQuality::Linear;
+    return q;
+}
+
+enum class LoopMode { None, Forward, PingPong };
+
 struct SampleZone {
     StereoBuffer audio;
+    std::shared_ptr<const StereoBuffer> shared_audio;
     int          sample_rate = 44100;
 
     int  root_note = 60;
@@ -122,13 +132,32 @@ struct SampleZone {
 
     size_t start = 0, end = 0;
     bool   looping    = false;
+    LoopMode loop_mode = LoopMode::None;
     size_t loop_start = 0, loop_end = 0;
+    size_t loop_crossfade_samples = 0;
+
+    double coarse_tune_semitones = 0.0;
+    double fine_tune_cents       = 0.0;
+    double pan                   = 0.0;
+    double attenuation_db        = 0.0;
+    double filter_cutoff_hz      = 20000.0;
+    double filter_q              = 0.7;
+    double scale_tuning          = 1.0;
+    DAHDSR envelope { 0.0, 0.0, 0.0, 0.0, 1.0, 0.005 };
 
     int          round_robin_group = 0;
+    int          exclusive_class   = 0;
     Articulation articulation      = Articulation::Sustain;
     bool         is_release_sample = false;
 
-    size_t effective_end() const { return end > 0 ? end : audio.size(); }
+    const StereoBuffer& buffer() const { return shared_audio ? *shared_audio : audio; }
+
+    LoopMode effective_loop_mode() const {
+        if (loop_mode != LoopMode::None) return loop_mode;
+        return looping ? LoopMode::Forward : LoopMode::None;
+    }
+
+    size_t effective_end() const { return end > 0 ? end : buffer().size(); }
 
     bool matches(int midi_note, int velocity127, Articulation art) const {
         if (midi_note < low_note || midi_note > high_note) return false;
@@ -186,43 +215,135 @@ private:
 
 class SamplePlayer {
 public:
-    static StereoBuffer render(const SampleZone& zone, const Note& note, int sample_rate) {
+    static StereoBuffer render(const SampleZone& zone, const Note& note, int sample_rate,
+                                InterpolationQuality quality = InterpolationQuality::Linear)
+    {
         if (sample_rate <= 0) sample_rate = global_config().sample_rate;
         const size_t n_out = static_cast<size_t>(std::max(0.0, note.duration) * sample_rate);
         StereoBuffer out(n_out);
-        if (n_out == 0 || zone.audio.empty()) return out;
+        const StereoBuffer& src = zone.buffer();
+        if (n_out == 0 || src.empty()) return out;
 
-        const double bend_ratio  = std::pow(2.0, note.pitch_bend_semitones / 12.0);
-        const double pitch_ratio = (midi_to_freq(note.midi_note) / midi_to_freq(zone.root_note)) * bend_ratio;
-        const double sr_ratio    = static_cast<double>(zone.sample_rate) / static_cast<double>(sample_rate);
-        const double read_step   = pitch_ratio * sr_ratio;
-        const double expr_gain   = std::max(0.0, std::min(1.0, note.expression));
+        const double sr_ratio  = static_cast<double>(zone.sample_rate) / static_cast<double>(sample_rate);
+        const double expr_gain = std::max(0.0, std::min(1.0, note.expression));
+        const double atten_gain = std::pow(10.0, zone.attenuation_db / 20.0);
+        const double velocity_gain = dynamics_to_velocity(note.dynamics);
+        const double tune_ratio = std::pow(2.0, (zone.coarse_tune_semitones + zone.fine_tune_cents / 100.0) / 12.0);
+        const bool has_continuous_bend = !note.pitch_bend_curve.empty();
+        const double const_bend_ratio = std::pow(2.0, note.pitch_bend_semitones / 12.0);
 
-        const size_t start = std::min(zone.start, zone.audio.size());
-        const size_t end   = std::min(zone.effective_end(), zone.audio.size());
-        const size_t loop_s = std::min(zone.loop_start, zone.audio.size());
-        const size_t loop_e = (zone.loop_end > 0) ? std::min(zone.loop_end, zone.audio.size()) : end;
+        const size_t start = std::min(zone.start, src.size());
+        const size_t end   = std::min(zone.effective_end(), src.size());
+        const size_t loop_s = std::min(zone.loop_start, src.size());
+        const size_t loop_e = (zone.loop_end > 0) ? std::min(zone.loop_end, src.size()) : end;
+        const LoopMode loop_mode = zone.effective_loop_mode();
+        const bool can_loop = loop_mode != LoopMode::None && loop_e > loop_s;
+
+        size_t crossfade = 0;
+        if (can_loop && loop_mode == LoopMode::Forward) {
+            size_t loop_len = loop_e - loop_s;
+            size_t requested = zone.loop_crossfade_samples > 0 ? zone.loop_crossfade_samples : 32;
+            crossfade = std::min(requested, loop_len / 4);
+        }
+
+        auto sample_raw = [&](size_t idx, int ch) -> float {
+            idx = std::min(idx, src.size() - 1);
+            return ch == 0 ? src.L[idx] : src.R[idx];
+        };
+
+        auto interp_at = [&](double pos, int ch) -> float {
+            long i0 = static_cast<long>(std::floor(pos));
+            double frac = pos - static_cast<double>(i0);
+            if (i0 < 0) i0 = 0;
+            size_t u0 = static_cast<size_t>(i0);
+
+            switch (quality) {
+                case InterpolationQuality::Nearest:
+                    return sample_raw(frac < 0.5 ? u0 : u0 + 1, ch);
+                case InterpolationQuality::Cubic: {
+                    size_t um1 = (u0 > 0) ? u0 - 1 : 0;
+                    size_t u1  = u0 + 1;
+                    size_t u2  = u0 + 2;
+                    float ym1 = sample_raw(um1, ch), y0 = sample_raw(u0, ch);
+                    float y1  = sample_raw(u1, ch),  y2 = sample_raw(u2, ch);
+                    float f = static_cast<float>(frac);
+                    float a0 = y0, a1 = 0.5f * (y1 - ym1);
+                    float a2 = ym1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;
+                    float a3 = 0.5f * (y2 - ym1) + 1.5f * (y0 - y1);
+                    return ((a3 * f + a2) * f + a1) * f + a0;
+                }
+                case InterpolationQuality::Linear:
+                default: {
+                    float y0 = sample_raw(u0, ch), y1 = sample_raw(u0 + 1, ch);
+                    return y0 * (1.0f - static_cast<float>(frac)) + y1 * static_cast<float>(frac);
+                }
+            }
+        };
+
+        auto read_ch = [&](double pos, int ch) -> float {
+            if (crossfade > 0 && pos >= static_cast<double>(loop_e) - static_cast<double>(crossfade) &&
+                pos < static_cast<double>(loop_e)) {
+                double tail_pos = pos;
+                double head_pos = static_cast<double>(loop_s) + (pos - (static_cast<double>(loop_e) - static_cast<double>(crossfade)));
+                double fade = (pos - (static_cast<double>(loop_e) - static_cast<double>(crossfade))) / static_cast<double>(crossfade);
+                float tail_v = interp_at(tail_pos, ch);
+                float head_v = interp_at(head_pos, ch);
+                return static_cast<float>(tail_v * (1.0 - fade) + head_v * fade);
+            }
+            return interp_at(pos, ch);
+        };
 
         double pos = static_cast<double>(start);
+        bool forward_dir = true;
+        const bool needs_filter = zone.filter_cutoff_hz < 19500.0;
+        SVFilter filt_l(SVFilter::Mode::LowPass, std::max(20.0, zone.filter_cutoff_hz), std::max(0.1, zone.filter_q));
+        SVFilter filt_r(SVFilter::Mode::LowPass, std::max(20.0, zone.filter_cutoff_hz), std::max(0.1, zone.filter_q));
+
         for (size_t i = 0; i < n_out; ++i) {
-            if (zone.looping && loop_e > loop_s && pos >= static_cast<double>(loop_e))
-                pos = loop_s + std::fmod(pos - loop_s, static_cast<double>(loop_e - loop_s));
-            if (!zone.looping && pos >= static_cast<double>(end)) {
+            double t = static_cast<double>(i) / sample_rate;
+            double bend_ratio = has_continuous_bend ? std::pow(2.0, note.bend_at(t) / 12.0) : const_bend_ratio;
+            double pitch_ratio = std::pow(2.0, (note.midi_note - zone.root_note) * zone.scale_tuning / 12.0)
+                                * bend_ratio * tune_ratio;
+            double read_step = pitch_ratio * sr_ratio;
+
+            if (can_loop) {
+                if (loop_mode == LoopMode::Forward) {
+                    if (pos >= static_cast<double>(loop_e)) {
+                        double loop_len = static_cast<double>(loop_e - loop_s);
+                        pos = static_cast<double>(loop_s) + std::fmod(pos - static_cast<double>(loop_e), loop_len);
+                    }
+                } else if (loop_mode == LoopMode::PingPong) {
+                    double loop_len = static_cast<double>(loop_e - loop_s);
+                    if (forward_dir && pos >= static_cast<double>(loop_e)) {
+                        double over = pos - static_cast<double>(loop_e);
+                        pos = static_cast<double>(loop_e) - std::fmod(over, loop_len);
+                        forward_dir = false;
+                    } else if (!forward_dir && pos <= static_cast<double>(loop_s)) {
+                        double under = static_cast<double>(loop_s) - pos;
+                        pos = static_cast<double>(loop_s) + std::fmod(under, loop_len);
+                        forward_dir = true;
+                    }
+                }
+            } else if (pos >= static_cast<double>(end)) {
                 pos = static_cast<double>(end) - 1e-6;
             }
 
-            size_t i0 = static_cast<size_t>(pos);
-            size_t i1 = std::min(i0 + 1, zone.audio.size() - 1);
-            float  frac = static_cast<float>(pos - static_cast<double>(i0));
+            float l = read_ch(pos, 0) * static_cast<float>(expr_gain * atten_gain * velocity_gain);
+            float r = src.size() > 0 ? read_ch(pos, 1) * static_cast<float>(expr_gain * atten_gain * velocity_gain) : l;
+            if (needs_filter) {
+                l = filt_l.tick(l, sample_rate);
+                r = filt_r.tick(r, sample_rate);
+            }
+            out.L[i] = l;
+            out.R[i] = r;
 
-            out.L[i] = (zone.audio.L[i0] * (1.0f - frac) + zone.audio.L[i1] * frac) * static_cast<float>(expr_gain);
-            out.R[i] = (zone.audio.R[i0] * (1.0f - frac) + zone.audio.R[i1] * frac) * static_cast<float>(expr_gain);
-
-            pos += read_step;
+            double step = read_step * (loop_mode == LoopMode::PingPong && !forward_dir ? -1.0 : 1.0);
+            pos += step;
         }
 
+        zone.envelope.apply(out.L, note.duration, -1.0, sample_rate);
+        zone.envelope.apply(out.R, note.duration, -1.0, sample_rate);
         fade_in(out, 0.002, sample_rate);
-        fade_out(out, 0.006, sample_rate);
         return out;
     }
 };
@@ -243,7 +364,7 @@ public:
         if (!samples.empty()) {
             double vel = dynamics_to_velocity(note.dynamics);
             if (const SampleZone* z = samples.find_zone(note.midi_note, vel, note.articulation))
-                return SamplePlayer::render(*z, note, sample_rate);
+                return SamplePlayer::render(*z, note, sample_rate, default_interpolation_quality());
         }
         if (fallback_model) return fallback_model(note, sample_rate);
         return make_stereo(note.duration, sample_rate);
